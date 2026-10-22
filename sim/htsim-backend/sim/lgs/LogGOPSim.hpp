@@ -1,10 +1,11 @@
+#include "MessageIdentity.hpp"
 #include <inttypes.h>
 
 #ifndef GRAPH_NODE_PROPERTIES
 #define GRAPH_NODE_PROPERTIES 1
 
 #define STRICT_ORDER // this is needed to keep order between Send/Recv and LocalOps in NBC case :-/
-// #define LIST_MATCH // enables debugging the queues (check if empty)
+#define LIST_MATCH // enables debugging the queues (check if empty)
 #define HOSTSYNC // this is experimental to count synchronization times induced by message transmissions
 
 typedef uint64_t btime_t;
@@ -32,8 +33,11 @@ class graph_node_properties {
 		uint32_t offset;          // for Parser (to identify schedule element)
 		uint32_t tag;							// tag for send/recv
     uint32_t handle;          // handle for network layer :-/
-		uint8_t proc;							// processing element for this operation
+		uint32_t stream;							// processing element for this operation
 		uint8_t nic;							// network interface for this operation
+    MessageIdentity message_id;
+    uint32_t peer_gpu = 0; // Remote GPU for sends and receives.
+    uint32_t gpu = 0; // Explicit GPU ID; separate from the network-interface field.
 		char type;							  // see below
     bool updated = false;
 };

@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "atlahs_htsim_api.h"
 #include "eqds.h"
 #include "atlahs_event.h"
@@ -16,8 +17,8 @@ void AtlahsHtsimApi::Send(const SendEvent &event, graph_node_properties elem) {
     int size = event.getSizeBytes();
     size = size * 1;
 
-    from = getHtsimNodeNumber(from, elem.nic);
-    to = getHtsimNodeNumber(to, elem.nic);
+    from = getHtsimNodeNumber(from, elem.gpu);
+    to = getHtsimNodeNumber(to, elem.peer_gpu);
 
     // Temporary solution
     if (llama_rand) {
@@ -27,6 +28,11 @@ void AtlahsHtsimApi::Send(const SendEvent &event, graph_node_properties elem) {
         }
     }
     
+    // Optional routing audit: report the actual endpoints supplied to transport.
+    if (std::getenv("ATLAHS_TRACE_ROUTES"))
+        std::cout << "ATLAHS_ROUTE " << event.getFrom() << " " << event.getTo()
+                  << " " << elem.gpu << " " << from << " " << to << std::endl;
+
     if (from == to) {
         std::cerr << "Error: Send event from and to the same node" << std::endl;
         exit(0);

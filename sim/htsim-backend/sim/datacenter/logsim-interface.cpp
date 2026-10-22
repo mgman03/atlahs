@@ -39,7 +39,7 @@ namespace std
 }
 #endif
 
-static bool print = false;
+static bool debug_print = false;
 
 
 LogSimInterface::LogSimInterface() {}
@@ -171,8 +171,11 @@ void LogSimInterface::flow_over(const EventOver &event) {
   _latest_recv->time = htsim_api->getGlobalTimeNs();
   _latest_recv->size = event.node->size;
   _latest_recv->offset = event.node->offset;
-  _latest_recv->proc = event.node->proc;
+  _latest_recv->stream = event.node->stream;
   _latest_recv->nic = event.node->nic;
+  _latest_recv->gpu = event.node->message_id.explicit_fields ? event.node->peer_gpu : event.node->gpu;
+  _latest_recv->peer_gpu = event.node->gpu;
+  _latest_recv->message_id = event.node->message_id;
 
   aq.push(*_latest_recv);
 }
@@ -252,88 +255,8 @@ void LogSimInterface::htsim_simulate_until(int64_t until) {
     return;
 }
 
-typedef struct {
-  // TODO: src and tag can go in case of hashmap matching
-  btime_t starttime; // only for visualization
-  uint32_t size, src, tag, offset, proc;
-} ruqelem_t;
+#include "lgs/MessageMatching.hpp"
 
-typedef unsigned int uint;
-typedef unsigned long int ulint;
-typedef unsigned long long int ullint;
-
-#ifdef LIST_MATCH
-// TODO this is really slow - reconsider design of rq and uq!
-// matches and removes element from list if found, otherwise returns
-// false
-typedef std::list<ruqelem_t> ruq_t;
-static inline int match(const graph_node_properties &elem, ruq_t *q, ruqelem_t *retelem=NULL) {
-
-  // MATCH attempts (i.e., number of elements searched to find a matching element)
-  int match_attempts = 0;
-  //std::cout << "UQ size " << q->size() << "\n";
-
-  if(print)
-    printf("++ [%i] searching matching queue for src %i tag %i\n", elem.host, elem.target, elem.tag);
-  // Iterate from the end of the queue
-  int curr_offset = -1;
-  // Only returns the matched element with the smallest offset
-  ruq_t::iterator matched_iter = q->end();
-  for(ruq_t::iterator iter=q->begin(); iter!=q->end(); ++iter) {
-    match_attempts++;
-    if(elem.target == ANY_SOURCE || iter->src == ANY_SOURCE || iter->src == elem.target) {
-      if(elem.tag == ANY_TAG || iter->tag == ANY_TAG || iter->tag == elem.tag) {
-        if (curr_offset == -1)
-        {
-          *retelem = *iter;
-          matched_iter = iter;
-          curr_offset = iter->offset;
-        }
-        else if (iter->offset < curr_offset)
-        {
-          *retelem = *iter;
-          matched_iter = iter;
-        }
-        // if(retelem)
-        //   *retelem=*iter;
-        // q->erase(iter);
-        // return match_attempts;
-      }
-    }
-  }
-  if (curr_offset != -1)
-  {
-    q->erase(matched_iter);
-    return match_attempts;
-  }
-  return -1;
-}
-#else
-class myhash { // I WANT LAMBDAS! :)
-  public:
-  size_t operator()(const std::pair<int,int>& x) const {
-    return (x.first>>16)+x.second;
-  }
-};
-typedef std::hash_map< std::pair</*tag*/int,int/*src*/>, std::queue<ruqelem_t>, myhash > ruq_t;
-static inline int match(const graph_node_properties &elem, ruq_t *q, ruqelem_t *retelem=NULL) {
-  
-  if(0) printf("++ [%i] searching matching queue for src %i tag %i\n", elem.host, elem.target, elem.tag);
-
-  ruq_t::iterator iter = q->find(std::make_pair(elem.tag, elem.target));
-  if(iter == q->end()) {
-    return -1;
-  }
-  std::queue<ruqelem_t> *tq=&iter->second;
-  if(tq->empty()) {
-    return -1;
-  }
-  if(retelem) *retelem=tq->front();
-  tq->pop();
-  //q->erase(iter);
-  return 0;
-}
-#endif
 
 int size_queue(std::vector<ruq_t> my_queue, int num_proce);
 
@@ -362,7 +285,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
     const int g = 0;
     const int L = 0;
     const double G = 0.04;
-    print = false;
+    debug_print = false;
     const uint32_t S = 0;
     bool custom_print = false;
 
@@ -376,16 +299,19 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
     Parser parser(filename_goal, false);
   
     const uint p = parser.schedules.size();
-    const int ncpus = parser.GetNumCPU();
-    const int nnics = parser.GetNumNIC();
+    const int ncpus = parser.GetNumStreams();
+    const int ngpus = parser.GetNumGPU();
     lgs_interface->htsim_api->setGoalRankMappingFromBinaryHeader(
-        static_cast<uint32_t>(p), ncpus, nnics);
-    printf("[ATLAHS] GOAL rank mapping: %s (LGS ranks=%u, CPUs=%d, NICs=%d, HTSIM nodes=%u)\n",
+        static_cast<uint32_t>(p), ncpus, ngpus);
+    // Named GPU IDs remove the need to infer rank layout from CPU/NIC counts.
+    if (parser.UsesExplicitGpuMapping())
+        lgs_interface->htsim_api->setGoalRankMapping(AtlahsHtsimApi::GoalRankMapping::UniqueNic);
+    printf("[ATLAHS] GOAL rank mapping: %s (LGS ranks=%u, CPUs=%d, GPUs=%d, HTSIM nodes=%u)\n",
            lgs_interface->htsim_api->getGoalRankMappingName(),
            p,
            ncpus,
-           nnics,
-           lgs_interface->htsim_api->usesUniqueNicRankMapping() ? p * nnics : p);
+           ngpus,
+           lgs_interface->htsim_api->usesUniqueNicRankMapping() ? p * ngpus : p);
     bool comm_dep_file_arg = false;
 
     // DATA structures for storing MPI matching statistics
@@ -440,9 +366,9 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
     for(uint i=0; i<p; ++i) {
       nexto[i].resize(ncpus);
       std::fill(nexto[i].begin(), nexto[i].end(), 0);
-      nextgr[i].resize(nnics);
+      nextgr[i].resize(ngpus);
       std::fill(nextgr[i].begin(), nextgr[i].end(), 0);
-      nextgs[i].resize(nnics);
+      nextgs[i].resize(ngpus);
       std::fill(nextgs[i].begin(), nextgs[i].end(), 0);
     }
   
@@ -470,7 +396,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
   
       // walk all new free operations and throw them in the queue 
       for(SerializedGraph::nodelist_t::iterator freeop=free_ops.begin(); freeop != free_ops.end(); ++freeop) {
-        //if(print) std::cout << *freeop << " " ;
+        //if(debug_print) std::cout << *freeop << " " ;
   
         freeop->host = host;
         freeop->time = 0;
@@ -480,13 +406,13 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
   
         switch(freeop->type) {
           case OP_LOCOP:
-            if(0) printf("init %i (%i,%i) loclop: %lu\n", host, freeop->proc, freeop->nic, (long unsigned int) freeop->size);
+            if(0) printf("init %i (%i,%i) loclop: %lu\n", host, freeop->stream, freeop->gpu, (long unsigned int) freeop->size);
             break;
           case OP_SEND:
-            if(print) printf("init %i (%i,%i) send to: %i, tag: %i, size: %lu\n", host, freeop->proc, freeop->nic, freeop->target, freeop->tag, (long unsigned int) freeop->size);
+            if(debug_print) printf("init %i (%i,%i) send to: %i, tag: %i, size: %lu\n", host, freeop->stream, freeop->gpu, freeop->target, freeop->tag, (long unsigned int) freeop->size);
             break;
           case OP_RECV:
-            if(print) printf("init %i (%i,%i) recvs from: %i, tag: %i, size: %lu\n", host, freeop->proc, freeop->nic, freeop->target, freeop->tag, (long unsigned int) freeop->size);
+            if(debug_print) printf("init %i (%i,%i) recvs from: %i, tag: %i, size: %lu\n", host, freeop->stream, freeop->gpu, freeop->target, freeop->tag, (long unsigned int) freeop->size);
             break;
           default:
             printf("not implemented!\n");
@@ -534,12 +460,12 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
 
         while (!lgs_interface->aq.empty() && !lgs_interface->have_more && lgs_interface->aq.top().time <= (lgs_interface->htsim_api->getGlobalTimeNs())) {   
           /* printf("Active Queue Size %d - Type %d - Host %d - CPU %d - Tag %d - Top Time %lu -- Size RQ %d -- Size UQ %d\n",
-            (int)lgs_interface->aq.size(), lgs_interface->aq.top().type, lgs_interface->aq.top().host, lgs_interface->aq.top().proc, lgs_interface->aq.top().tag, lgs_interface->aq.top().time, 
+            (int)lgs_interface->aq.size(), lgs_interface->aq.top().type, lgs_interface->aq.top().host, lgs_interface->aq.top().stream, lgs_interface->aq.top().tag, lgs_interface->aq.top().time,
             size_queue(rq, p), size_queue(uq, p));  */
 
           /* printf("Active Queue Size %d - Top Time %lu Type %d - HTSIM Time "
             "%lu - Host %d - Proc %d - NIC Busy %d\n",
-            (int)lgs_interface->aq.size(), lgs_interface->aq.top().time, lgs_interface->aq.top().type, lgs_interface->htsim_api->getGlobalTimeNs(), lgs_interface->aq.top().host, lgs_interface->aq.top().proc, lgs_interface->nic_available[lgs_interface->aq.top().host]);  */
+            (int)lgs_interface->aq.size(), lgs_interface->aq.top().time, lgs_interface->aq.top().type, lgs_interface->htsim_api->getGlobalTimeNs(), lgs_interface->aq.top().host, lgs_interface->aq.top().stream, lgs_interface->nic_available[lgs_interface->aq.top().host]);  */
 
             count_cycles++;
             if (count_cycles > 200000000) {
@@ -554,7 +480,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
             lgs_interface->aq.pop();
 
             // Update time
-            //elem.nic = 0;
+            //elem.gpu = 0;
             if (elem.time < lgs_interface->htsim_api->getGlobalTimeNs()) {
               elem.time = lgs_interface->htsim_api->getGlobalTimeNs();
             }
@@ -568,8 +494,8 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
             // the BIG switch on element type that we just found 
             switch(elem.type) {
             case OP_LOCOP: {
-                if(0) printf("[%i] found loclop of length %lu - offset: %d -  t: %lu (CPU: %i)\n", elem.host, (ulint)elem.size, elem.offset, (ulint)elem.time, elem.proc);
-                if(nexto[elem.host][elem.proc] <= elem.time) { // local o available!
+                if(0) printf("[%i] found loclop of length %lu - offset: %d -  t: %lu (CPU: %i)\n", elem.host, (ulint)elem.size, elem.offset, (ulint)elem.time, elem.stream);
+                if(nexto[elem.host][elem.stream] <= elem.time) { // local o available!
 
                     if (elem.size == 0) { // Hack for 0 Computes
                       elem.size = 1;
@@ -578,10 +504,10 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                     // Update CPU time
                     btime_t noise = 0; // No noise with HTSIM
                     uint64_t cpu_time = elem.time + elem.size + noise;
-                    nexto[elem.host][elem.proc] = cpu_time;
+                    nexto[elem.host][elem.stream] = cpu_time;
         
-                    if (print)
-                        printf("-- nexto[%i][%i] = %lu\n", elem.host, elem.proc, nexto[elem.host][elem.proc]);
+                    if (debug_print)
+                        printf("-- nexto[%i][%i] = %lu\n", elem.host, elem.stream, nexto[elem.host][elem.stream]);
 
                     // Mark Compute As Started
                     parser.schedules[elem.host].MarkNodeAsStarted(elem.offset);
@@ -595,29 +521,29 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                     // Re-Insert Compute with in progress type and execute it on HTSIM
                     lgs_interface->aq.push(elem);
                     lgs_interface->execute_compute(elem, p);
-                    if(0) printf("[%i] done loclop of length %lu - offset: %d -  t: %lu (CPU: %i)\n", elem.host, (ulint)elem.size, elem.offset, (ulint)elem.time, elem.proc);
+                    if(0) printf("[%i] done loclop of length %lu - offset: %d -  t: %lu (CPU: %i)\n", elem.host, (ulint)elem.size, elem.offset, (ulint)elem.time, elem.stream);
                 } else {
-                    elem.time = nexto[elem.host][elem.proc];
+                    elem.time = nexto[elem.host][elem.stream];
                     lgs_interface->aq.push(std::move(elem)); 
                     num_reinserts_o++;
-                    if(0) printf("[%i] reinsert loclop of length %lu - offset: %d -  t: %lu (CPU: %i)\n", elem.host, (ulint)elem.size, elem.offset, (ulint)elem.time, elem.proc);
-                    if(print) printf("-- locop local o not available -- reinserting with t: %lu\n", (long unsigned int) elem.time);
+                    if(0) printf("[%i] reinsert loclop of length %lu - offset: %d -  t: %lu (CPU: %i)\n", elem.host, (ulint)elem.size, elem.offset, (ulint)elem.time, elem.stream);
+                    if(debug_print) printf("-- locop local o not available -- reinserting with t: %lu\n", (long unsigned int) elem.time);
                 } 
             } break;
     
             case OP_LOCOP_IN_PROGRESS: {
               uint64_t cpu_time = elem.time;
-              //nexto[elem.host][elem.proc] = cpu_time;  
+              //nexto[elem.host][elem.stream] = cpu_time;
               parser.schedules[elem.host].MarkNodeAsDone(elem.offset, cpu_time);
               check_hosts.insert(elem.host);
             } break;
             
             case OP_SEND: { // a send op
-              if(print) printf("[%i] found send to %i tag %lu - t: %lu (CPU: %i)\n", elem.host, elem.target, (ulint)elem.tag, (ulint)elem.time, elem.proc);
+              if(debug_print) printf("[%i] found send to %i tag %lu - t: %lu (CPU: %i)\n", elem.host, elem.target, (ulint)elem.tag, (ulint)elem.time, elem.stream);
   
-              uint64_t resource_time = std::max(nexto[elem.host][elem.proc], nextgs[elem.host][elem.nic]);
+              uint64_t resource_time = std::max(nexto[elem.host][elem.stream], nextgs[elem.host][elem.gpu]);
               if(resource_time <= elem.time) { // local o,g available!
-                  if(print) 
+                  if(debug_print)
                     printf("-- satisfy local irequires\n");
 
                   // We Mark the Send as started, before passing it to htsim
@@ -633,7 +559,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                   // Update CPU Availability
                   btime_t noise = 0;
                   uint64_t cpu_time = elem.time + lgs_interface->lgs_o + noise; // We don't model the other paramter in HTSIM
-                  nexto[elem.host][elem.proc] = cpu_time;
+                  nexto[elem.host][elem.stream] = cpu_time;
                   // Calc Actual Size in HTSIM
                   int original_size = elem.size;
                   int message_size = elem.size;
@@ -643,8 +569,8 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                   elem.size = updated_size;
 
                   uint64_t bandwidth_cost2 = static_cast<uint64_t>((elem.size) * G);
-                  nextgs[elem.host][elem.nic] = elem.time + g + bandwidth_cost2; 
-                  can_simulate_until = nextgs[elem.host][elem.nic];
+                  nextgs[elem.host][elem.gpu] = elem.time + g + bandwidth_cost2;
+                  can_simulate_until = nextgs[elem.host][elem.gpu];
 
                   lgs_interface->nic_available[elem.host] = false;
                   lgs_interface->sends_active++;
@@ -657,11 +583,11 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                   elem.ts = aqtime++; // new element in queue 
           #endif    
               } else { // local o,g unavailable - retry later
-              if(print) printf("-- send local o,g not available -- reinserting\n");
+              if(debug_print) printf("-- send local o,g not available -- reinserting\n");
                   //printf("Reinseringg send %d %d %d %d at %lu\n", elem.host, elem.target, elem.tag, elem.size, resource_time);
                   elem.time = resource_time;
                   lgs_interface->aq.push(std::move(elem));
-                  if (nexto[elem.host][elem.proc] > nextgs[elem.host][elem.nic])
+                  if (nexto[elem.host][elem.stream] > nextgs[elem.host][elem.gpu])
                       num_reinserts_g++;
                   else
                       num_reinserts_g++;
@@ -669,14 +595,14 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                                               
           } break;
             case OP_RECV: {
-                if(print)
+                if(debug_print)
                     printf("[%i] found recv from %i tag %lu - t: %lu, label: %lu (CPU: %i)\n",
-                            elem.host, elem.target, (ulint)elem.tag, (ulint)elem.time, (ulint)elem.offset + 1, elem.proc);
+                            elem.host, elem.target, (ulint)elem.tag, (ulint)elem.time, (ulint)elem.offset + 1, elem.stream);
     
                 parser.schedules[elem.host].MarkNodeAsStarted(elem.offset);
                 // check_hosts.push_back(elem.host);
                 check_hosts.insert(elem.host);
-                if(print) printf("-- satisfy local irequires\n");
+                if(debug_print) printf("-- satisfy local irequires\n");
                 
                 ruqelem_t matched_elem; 
                 // NUMBER of elements that were searched during message matching
@@ -693,13 +619,16 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                 }
                 match_attempts = match(elem, &uq[elem.host], &matched_elem);
                 if(match_attempts >= 0) { // found it in local UQ 
-                    if (comm_dep_file_given) {
+                    if (comm_dep_file_given || std::getenv("ATLAHS_TRACE_MATCHES")) {
                         // Stores communication dependencies
                         auto dep = std::make_tuple(matched_elem.src, matched_elem.offset,
                                                 elem.host, elem.offset);
                         comm_deps.push_back(dep);
+                        if (std::getenv("ATLAHS_TRACE_MATCHES"))
+                            std::cout << "ATLAHS_MATCH " << std::get<0>(dep) << " " << std::get<1>(dep)
+                                      << " " << std::get<2>(dep) << " " << std::get<3>(dep) << "\n";
                     }
-                    if(print) 
+                    if(debug_print)
                       printf("-- found in local UQ\n");
 
                     if(qstat_given) {
@@ -710,41 +639,46 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                     }
                     
                     assert(elem.time >= matched_elem.starttime);
-                    uint64_t nic_time = std::max(nextgs[elem.host][elem.nic], elem.time) + g;
+                    uint64_t nic_time = std::max(nextgs[elem.host][elem.gpu], elem.time) + g;
                     uint64_t cpu_time = nic_time + lgs_interface->lgs_o + (elem.size - 1) * 0;       
         
                     // satisfy local requires
                     parser.schedules[matched_elem.src].MarkNodeAsDone(matched_elem.offset, cpu_time);
                     check_hosts.insert(matched_elem.src);
 
-                    if (nexto[matched_elem.src][elem.proc] < cpu_time)
+                    const auto sender_stream = elem.message_id.explicit_fields ? matched_elem.stream : elem.stream;
+                    const auto sender_gpu = elem.message_id.explicit_fields ? matched_elem.peer_gpu : elem.gpu;
+                    if (nexto[matched_elem.src][sender_stream] < cpu_time)
                     {
-                      nexto[matched_elem.src][elem.proc] = cpu_time;
+                      nexto[matched_elem.src][sender_stream] = cpu_time;
                     }
-                    if (nextgs[matched_elem.src][elem.nic] < nic_time)
+                    if (nextgs[matched_elem.src][sender_gpu] < nic_time)
                     {
-                      nextgs[matched_elem.src][elem.nic] = nic_time;
+                      nextgs[matched_elem.src][sender_gpu] = nic_time;
                     }
                     // check_hosts.push_back(elem.host);
                     parser.schedules[elem.host].MarkNodeAsDone(elem.offset, cpu_time);
                     check_hosts.insert(elem.host);
-                    if(print) printf("-- satisfy local requires\n");
+                    if(debug_print) printf("-- satisfy local requires\n");
                 } else { // not found in local UQ - add to RQ
                     if(qstat_given) {
                         // RECORD match queue statistics
                         std::pair<int,btime_t> match = std::make_pair((int)uq[elem.host].size(), elem.time);
                         uq_misses[elem.host].push_back(match);
                     }
-                    if(print) printf("-- not found in local UQ -- add to RQ\n");
+                    if(debug_print) printf("-- not found in local UQ -- add to RQ\n");
                     ruqelem_t nelem; 
                     nelem.size = elem.size;
                     nelem.src = elem.target;
                     nelem.tag = elem.tag;
+                  nelem.message_id = elem.message_id;
+                  nelem.gpu = elem.gpu;
+                  nelem.peer_gpu = elem.peer_gpu;
                     nelem.offset = elem.offset;
-                    nelem.proc = elem.proc; 
+                    nelem.stream = elem.stream;
             #ifdef LIST_MATCH
                     rq[elem.host].push_back(nelem);
-                    if (print)
+                    if (debug_print)
                         std::cout << "-- Pushed to RQ: " << nelem.src << " " << nelem.tag << " [RQ size:" << rq[elem.host].size() << "]" << std::endl;
             #else
                     rq[elem.host][std::make_pair(nelem.tag,nelem.src)].push(nelem);
@@ -754,7 +688,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
     
             case OP_MSG: {
                 if(0)
-                printf("[%i] found msg from %i, t: %lu offset: %i, (CPU: %i)\n", elem.host, elem.target, (ulint)elem.size, elem.offset, elem.proc);
+                printf("[%i] found msg from %i, t: %lu offset: %i, (CPU: %i)\n", elem.host, elem.target, (ulint)elem.size, elem.offset, elem.stream);
                 uint64_t earliestfinish;
 
                 // NUMBER of elements that were searched during message matching
@@ -770,8 +704,8 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                   assert(elem.size > 0);
 
                   // The message needs to be executed on the CPU that was used to receive the message
-                  uint8_t cpu = matched_elem.proc;
-                  uint64_t resource_time = std::max(nexto[elem.host][cpu], nextgr[elem.host][elem.nic]);
+                  uint32_t cpu = matched_elem.stream;
+                  uint64_t resource_time = std::max(nexto[elem.host][cpu], nextgr[elem.host][elem.gpu]);
 
                   /* printf("OP_MSG found IN RQ -- Resource Time %lu <= Elem Time %lu\n", 
                          resource_time, elem.time); */
@@ -780,14 +714,14 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                     btime_t noise = 0; // No noise in HTSIM
                     //assert(elem.time >= nexto[elem.host][cpu]);
 
-                    uint64_t nic_time = std::max(nextgr[elem.host][elem.nic], elem.time) + g;
+                    uint64_t nic_time = std::max(nextgr[elem.host][elem.gpu], elem.time) + g;
                     uint64_t cpu_time = nic_time + 0 + noise + (elem.size-1) * 0;
 
                     nexto[elem.host][cpu] = cpu_time;
-                    nextgr[elem.host][elem.nic] = nic_time;
+                    nextgr[elem.host][elem.gpu] = nic_time;
                     
-                    if (print) {
-                      printf("-- executing on cpu %i, nexto[%i][%i] = %lu, nextgr[%i][%i] = %lu\n", cpu, elem.host, cpu, nexto[elem.host][cpu], elem.host, elem.nic, nextgr[elem.host][elem.nic]);
+                    if (debug_print) {
+                      printf("-- executing on cpu %i, nexto[%i][%i] = %lu, nextgr[%i][%i] = %lu\n", cpu, elem.host, cpu, nexto[elem.host][cpu], elem.host, elem.gpu, nextgr[elem.host][elem.gpu]);
                     }
 
                         // UPDATE the maximum RQ size
@@ -795,11 +729,14 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                       rq_max[elem.host] = std::max((int)rq[elem.host].size(), rq_max[elem.host]);
                     }
 
-                    if (comm_dep_file_given) {
+                    if (comm_dep_file_given || std::getenv("ATLAHS_TRACE_MATCHES")) {
                       // Stores communication dependencies
                       auto dep = std::make_tuple(elem.target, elem.offset,
                                                   elem.host, matched_elem.offset);
                       comm_deps.push_back(dep);
+                        if (std::getenv("ATLAHS_TRACE_MATCHES"))
+                            std::cout << "ATLAHS_MATCH " << std::get<0>(dep) << " " << std::get<1>(dep)
+                                      << " " << std::get<2>(dep) << " " << std::get<3>(dep) << "\n";
                     }
 
                     if(qstat_given) {
@@ -810,7 +747,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                       rq_times[elem.host].push_back(elem.time - matched_elem.starttime);
                     }
 
-                    if(print)
+                    if(debug_print)
                       printf("-- found in RQ\n");
 
 
@@ -819,11 +756,12 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                     //printf("Received1 Something and Matched schedule %d offset %d - Set as Done\n", elem.target, elem.offset);
                     check_hosts.insert(elem.target);
 
-                    if (nexto[elem.target][elem.proc] < cpu_time) {
-                      nexto[elem.target][elem.proc] = cpu_time;
+                    if (nexto[elem.target][elem.stream] < cpu_time) {
+                      nexto[elem.target][elem.stream] = cpu_time;
                     }
-                    if (nextgs[elem.target][elem.nic] < nic_time) {
-                      nextgs[elem.target][elem.nic] = nic_time;
+                    const auto sender_gpu = elem.message_id.explicit_fields ? elem.peer_gpu : elem.gpu;
+                    if (nextgs[elem.target][sender_gpu] < nic_time) {
+                      nextgs[elem.target][sender_gpu] = nic_time;
                     }
 
 
@@ -832,16 +770,16 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                     //printf("Received2 Something and Matched schedule %d offset %d - Set as Done\n", elem.target, elem.offset);
                     check_hosts.insert(elem.host);
                   } else {
-                    if(print)
+                    if(debug_print)
                       printf("-- msg o,g not available, max(%lu, %lu) > %lu -- reinserting\n",
                             (long unsigned int) nexto[elem.host][cpu],
-                            (long unsigned int) nextgr[elem.host][elem.nic],
+                            (long unsigned int) nextgr[elem.host][elem.gpu],
                             (long unsigned int) elem.time);
                     
-                    elem.time = std::max(nexto[elem.host][cpu], nextgr[elem.host][elem.nic]);
+                    elem.time = std::max(nexto[elem.host][cpu], nextgr[elem.host][elem.gpu]);
                     lgs_interface->aq.push(std::move(elem));
                     // if (cpu_time > nic_time)
-                    if (nexto[elem.host][cpu] > nextgr[elem.host][elem.nic])
+                    if (nexto[elem.host][cpu] > nextgr[elem.host][elem.gpu])
                       num_reinserts_g++;
                     else
                       num_reinserts_g++;
@@ -862,12 +800,16 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                     rq_misses[elem.host].push_back(match);
                   }
 
-                  if(print) printf("-- not found in RQ - add to UQ\n");
+                  if(debug_print) printf("-- not found in RQ - add to UQ\n");
                   ruqelem_t nelem;
                   nelem.size = elem.size;
                   nelem.src = elem.target;
                   nelem.tag = elem.tag;
+                  nelem.message_id = elem.message_id;
+                  nelem.gpu = elem.gpu;
+                  nelem.peer_gpu = elem.peer_gpu;
                   nelem.offset = elem.offset;
+                  nelem.stream = elem.stream;
                   nelem.starttime = elem.time; // when it was started
     #ifdef LIST_MATCH
                   uq[elem.host].push_back(nelem);
@@ -891,7 +833,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
       recev_msg.updated = false;
       bool unlocked_elem = false;
 
-      if (print)
+      if (debug_print)
         std::cout << "[INFO] Checking for free operations on hosts:" << std::endl;
 
       
@@ -908,7 +850,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
         
         // walk all new free operations and throw them in the queue 
         for(SerializedGraph::nodelist_t::iterator freeop=free_ops.begin(); freeop != free_ops.end(); ++freeop) {
-          //if(print) std::cout << *freeop << " " ;
+          //if(debug_print) std::cout << *freeop << " " ;
   
           new_events = true;
   
@@ -921,28 +863,28 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
           
           switch(freeop->type) {
             case OP_LOCOP:
-              // freeop->time = nexto[host][freeop->proc];
-              freeop->time = std::max(freeop->starttime, nexto[host][freeop->proc]);
+              // freeop->time = nexto[host][freeop->stream];
+              freeop->time = std::max(freeop->starttime, nexto[host][freeop->stream]);
               freeop->time = std::max(lgs_interface->htsim_api->getGlobalTimeNs(), freeop->time);
               if(0)
-                printf("Freeop %i (%i,%i) loclop: %lu, time: %lu, offset: %i\n", host, freeop->proc, freeop->nic, (long unsigned int) freeop->size, (long unsigned int)freeop->time, freeop->offset);
+                printf("Freeop %i (%i,%i) loclop: %lu, time: %lu, offset: %i\n", host, freeop->stream, freeop->gpu, (long unsigned int) freeop->size, (long unsigned int)freeop->time, freeop->offset);
               break;
             case OP_SEND:
-              freeop->time = std::max(nexto[host][freeop->proc], nextgs[host][freeop->nic]);
+              freeop->time = std::max(nexto[host][freeop->stream], nextgs[host][freeop->gpu]);
               freeop->time = std::max(lgs_interface->htsim_api->getGlobalTimeNs(), freeop->time);
               //freeop->time = lgs_interface->htsim_api->getGlobalTimeNs();
-              // if (freeop->proc == 73)
+              // if (freeop->stream == 73)
               // {
-              //   std::cout << "[DEBUG] HOST " << host << " Send offset " << freeop->offset << " NextO: " << nexto[host][freeop->proc] / 1e9 << " Time: " << freeop->time / 1e9 << std::endl;
+              //   std::cout << "[DEBUG] HOST " << host << " Send offset " << freeop->offset << " NextO: " << nexto[host][freeop->stream] / 1e9 << " Time: " << freeop->time / 1e9 << std::endl;
               // }
               if(0)
-                printf("Freeop %i (%i,%i) send to: %i, tag: %i, size: %lu, time: %lu, offset: %i\n", host, freeop->proc, freeop->nic, freeop->target, freeop->tag, (long unsigned int) freeop->size, (long unsigned int)freeop->time, freeop->offset);
+                printf("Freeop %i (%i,%i) send to: %i, tag: %i, size: %lu, time: %lu, offset: %i\n", host, freeop->stream, freeop->gpu, freeop->target, freeop->tag, (long unsigned int) freeop->size, (long unsigned int)freeop->time, freeop->offset);
               break;
             case OP_RECV:
-              // freeop->time = nexto[host][freeop->proc];
+              // freeop->time = nexto[host][freeop->stream];
               freeop->time = freeop->starttime;
               if(0)
-                printf("Freeop %i (%i,%i) recvs from: %i, tag: %i, size: %lu, time: %lu, offset: %i\n", host, freeop->proc, freeop->nic, freeop->target, freeop->tag, (long unsigned int) freeop->size, (long unsigned int)freeop->time, freeop->offset);
+                printf("Freeop %i (%i,%i) recvs from: %i, tag: %i, size: %lu, time: %lu, offset: %i\n", host, freeop->stream, freeop->gpu, freeop->target, freeop->tag, (long unsigned int) freeop->size, (long unsigned int)freeop->time, freeop->offset);
               break;
             default:
               printf("not implemented!\n");
@@ -972,7 +914,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
         lgs_interface->htsim_simulate_until(lgs_interface->aq.top().time);
       }
 
-      if (print)
+      if (debug_print)
         std::cout << "[INFO] Finished checking for free operations on hosts. [AQ size: " << lgs_interface->aq.size() << "]" << std::endl;
       if(progress_given) {
         if(num_events/100*lastperc < aqtime) {
@@ -1028,8 +970,10 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
   
     }
     
+    if (!ok)
+      throw std::runtime_error("ATLAHS simulation ended with unmatched messages or receives");
     if (ok) {
-      if(p <= 128 && !batchmode_given) { // print all hosts
+      if(p <= 128 && !batchmode_given) { // debug_print all hosts
         printf("Times: \n");
         host = 0;
         for(uint i=0; i<p; ++i) {
@@ -1046,7 +990,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
           //   }
           // }
         }
-      }  // print only maximum
+      }  // debug_print only maximum
       long long unsigned int max=0;
       int host=0;
       for(uint i=0; i<p; ++i) { // find maximum end time

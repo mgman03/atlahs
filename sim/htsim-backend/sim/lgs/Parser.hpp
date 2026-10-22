@@ -1,3 +1,4 @@
+#include <limits>
 #include <map>
 #include <vector>
 #include <string>
@@ -12,6 +13,9 @@
 #include <sys/types.h>
 
 #include "LogGOPSim.hpp"
+#include "simulators/atlahs/AtlahsAdapter.hpp"
+#include "trace_format/BinaryFormat.hpp"
+#include <memory>
 
 #define MAGIC_COOKIE 4223
 #define MAGIC_COOKIE_INVALID 2342
@@ -42,20 +46,7 @@ struct Node {
 	
 };
 
-struct DeserializedNode {
-
-	uint32_t           DependenciesCnt;
-	char               Type;
-	uint32_t           Peer;
-	uint64_t           Size;
-	uint32_t           Tag;
-	uint8_t            Proc;
-	uint8_t            Nic;
-	uint32_t           offset;
-	uint64_t		   start_time;
-	std::vector<uint32_t> DependOnMe;
-	std::vector<uint32_t> StartDependOnMe;
-};
+using DeserializedNode = traceschema::AtlahsNode;
 
 class Graph {
 	
@@ -428,6 +419,7 @@ class SerializedGraph {
 	
 	private:
 	
+	traceschema::AtlahsAdapter* reader_ = nullptr;
 	char* mapping_start; // argh. this should be void* but c++ is anal on void*-arithmetic
 	uint32_t num_root_nodes;
 	uint32_t num_nodes;
@@ -446,6 +438,10 @@ class SerializedGraph {
 
 
 	void add_root_nodes() {
+        if (reader_) {
+            executableNodes = reader_->read_root_nodes(my_rank);
+            return;
+        }
 	
 		uint32_t num_root_nodes = (uint32_t) *( (uint32_t*) (mapping_start + sizeof(uint32_t)) );
 		
@@ -461,6 +457,7 @@ class SerializedGraph {
 	}
 
 	DeserializedNode get_node_by_offset(uint32_t offset) {
+        if (reader_) return reader_->read_node(my_rank, offset);
 	
 		//printf("[timos] trying to get node with offset %i\n", offset);
 	
@@ -473,7 +470,7 @@ class SerializedGraph {
 		// printf("yyy 1\n");
 		int SIZEOF_NODE_INFO = sizeof(char) + sizeof(uint64_t) + sizeof(uint32_t)*7 + sizeof(uint8_t)*2;
 		char* start_of_node = mapping_start + sizeof(uint32_t)*2 + sizeof(uint32_t)*num_root_nodes + SIZEOF_NODE_INFO*offset;
-		DeserializedNode N;
+		DeserializedNode N{};
 		// printf("yyy 2\n");
 
 		N.DependenciesCnt = (uint32_t) *( (uint32_t*) start_of_node);
@@ -483,6 +480,9 @@ class SerializedGraph {
 		N.Tag = (uint32_t) *( (uint32_t*) (start_of_node + sizeof(uint32_t) + sizeof(char) + sizeof(uint32_t) + sizeof(uint64_t)));
 		N.Proc = (uint8_t) *( (uint8_t*) (start_of_node + sizeof(uint32_t) + sizeof(char) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t)));
 		N.Nic = (uint8_t) *( (uint8_t*) (start_of_node + sizeof(uint32_t) + sizeof(char) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint8_t)));
+        N.Stream = N.Proc; // Legacy CPU IDs identify execution streams.
+        N.PeerGpu = N.Nic; // Legacy routing assumes the same local index on both hosts.
+        N.Gpu = N.Nic; // Legacy traces overload NIC IDs with GPU selection.
 		N.offset = (uint32_t) offset;
 		uint32_t num_deps =                      (uint32_t) *( (uint32_t*) (start_of_node + sizeof(char) + sizeof(uint64_t) + sizeof(uint32_t)*3 + sizeof(uint8_t)*2));
 		uint32_t deps_startoffset_in_apdx =      (uint32_t) *( (uint32_t*) (start_of_node + sizeof(char) + sizeof(uint64_t) + sizeof(uint32_t)*4 + sizeof(uint8_t)*2));
@@ -492,34 +492,43 @@ class SerializedGraph {
 		// printf("yyy 3 start of apdx = mapping start + %i\n", sizeof(uint32_t)*2 + sizeof(uint32_t)*num_root_nodes + SIZEOF_NODE_INFO*num_nodes);
 		// printf("yyy 3 numrootnodes = %i, SIZEOFNODEINFO = %i, num_nodes = %i\n", num_root_nodes, SIZEOF_NODE_INFO, num_nodes);
 		char* start_of_apdx = mapping_start + sizeof(uint32_t)*2 + sizeof(uint32_t)*num_root_nodes + SIZEOF_NODE_INFO*num_nodes;
-		for (uint32_t cnt=0; cnt<num_deps; cnt++) {
-			// printf("yyy 3.5 (%i, %i)\n", num_deps, cnt);
-			// printf("yyy (start of appendix: %i, deps startoffset in apdx %i, cnt %i)\n", start_of_apdx, deps_startoffset_in_apdx, cnt);
-			uint32_t depnode = (uint32_t) *( (uint32_t*) (start_of_apdx + (deps_startoffset_in_apdx + cnt)*sizeof(uint32_t)));
-			
-			//printf("num_root_nodes: %u\n", num_root_nodes);
-			//printf("SIZEOF_NODE_INFO: %i\n", SIZEOF_NODE_INFO);
-			//printf("num_nodes: %u\n", num_nodes);
-			//printf("start of appdx: %lu bytes after mapping_start\n", sizeof(uint32_t)*2 + sizeof(uint32_t)*num_root_nodes + SIZEOF_NODE_INFO*num_nodes );
+        const auto dependency_bytes = reinterpret_cast<const std::byte*>(start_of_apdx);
+        N.DependOnMe = traceschema::NodeIndexView::native(
+            {dependency_bytes + std::size_t{deps_startoffset_in_apdx} * sizeof(uint32_t),
+             std::size_t{num_deps} * sizeof(uint32_t)}, num_nodes);
+        N.StartDependOnMe = traceschema::NodeIndexView::native(
+            {dependency_bytes + std::size_t{startdeps_startoffset_in_apdx} * sizeof(uint32_t),
+             std::size_t{num_startdeps} * sizeof(uint32_t)}, num_nodes);
 
-			assert(depnode < num_nodes);
-			
-			N.DependOnMe.push_back(depnode);
-			// printf("yyy 3.75\n");
-		}
-		// printf("yyy 4\n");
-		for (uint32_t cnt=0; cnt<num_startdeps; cnt++) {
-			N.StartDependOnMe.push_back((uint32_t) *( (uint32_t*) (start_of_apdx + (startdeps_startoffset_in_apdx + cnt)*sizeof(uint32_t))));
-		}
 		// printf("yyy 5\n");
 			
 		return N;
 	}
 
 
-	public:
 
-	uint32_t GetNumNodes() {
+    uint64_t decrement_dependency_count(uint32_t offset) {
+        if (reader_) return reader_->decrement_dependency_count(my_rank, offset);
+        const auto record_size = sizeof(char) + sizeof(uint64_t) + sizeof(uint32_t)*7 + sizeof(uint8_t)*2;
+        char* position = mapping_start + sizeof(uint32_t)*2 + sizeof(uint32_t)*num_root_nodes + record_size*offset;
+        uint32_t count;
+        memcpy(&count, position, sizeof(count));
+        --count;
+        memcpy(position, &count, sizeof(count));
+        return count;
+    }
+
+    public:
+
+    SerializedGraph(traceschema::AtlahsAdapter& reader, uint32_t rank)
+        : reader_(&reader), mapping_start(nullptr), my_rank(rank) {
+        num_nodes = reader.get_node_count(rank);
+        num_root_nodes = reader.get_root_count(rank);
+        num_ranks_in_schedule = reader.get_rank_count();
+        add_root_nodes();
+    }
+
+    uint32_t GetNumNodes() {
 		return this->num_nodes;		
 	}
 
@@ -559,10 +568,10 @@ class SerializedGraph {
 			}
 
 			for (std::vector<DeserializedNode>::iterator it = allNodes.begin(); it != allNodes.end(); it++) {
-				for (std::vector<uint32_t>::iterator dit = (*it).DependOnMe.begin(); dit != (*it).DependOnMe.end(); dit++) {
+				for (auto dit = (*it).DependOnMe.begin(); dit != (*it).DependOnMe.end(); dit++) {
 					fprintf(fd, "%i:f0 -> %i:f0\n", (*it).offset, (*dit));
 				}
-				for (std::vector<uint32_t>::iterator dit = (*it).StartDependOnMe.begin(); dit != (*it).StartDependOnMe.end(); dit++) {
+				for (auto dit = (*it).StartDependOnMe.begin(); dit != (*it).StartDependOnMe.end(); dit++) {
 					fprintf(fd, "%i:f0 -> %i:f0 [arrowhead=diamond]\n", (*it).offset, (*dit));
 				}
 			}
@@ -612,10 +621,8 @@ class SerializedGraph {
 		for (uint32_t cnt=0; cnt<N.StartDependOnMe.size(); cnt++) {
 			uint32_t offset = N.StartDependOnMe[cnt];
 	
-			int SIZEOF_NODE_INFO = sizeof(char) + sizeof(uint64_t) + sizeof(uint32_t)*7 + sizeof(uint8_t)*2;
-			uint32_t* dep_cnt = (uint32_t*) (mapping_start + sizeof(uint32_t)*2 + sizeof(uint32_t)*num_root_nodes + SIZEOF_NODE_INFO*offset);
-			(*dep_cnt)--;
-			if ((*dep_cnt) == 0) {
+			const auto remaining_dependencies = decrement_dependency_count(offset);
+			if (remaining_dependencies == 0) {
 				executableNodes.push_back(get_node_by_offset(offset));
 			}
 		}
@@ -628,10 +635,8 @@ class SerializedGraph {
 		for (uint32_t cnt=0; cnt<N.DependOnMe.size(); cnt++) {
 			uint32_t offset = N.DependOnMe[cnt];
 	
-			int SIZEOF_NODE_INFO = sizeof(char) + sizeof(uint64_t) + sizeof(uint32_t)*7 + sizeof(uint8_t)*2;
-			uint32_t* dep_cnt = (uint32_t*) (mapping_start + sizeof(uint32_t)*2 + sizeof(uint32_t)*num_root_nodes + SIZEOF_NODE_INFO*offset);
-			(*dep_cnt)--;
-			if ((*dep_cnt) == 0) {
+			const auto remaining_dependencies = decrement_dependency_count(offset);
+			if (remaining_dependencies == 0) {
 				executableNodes.push_back(get_node_by_offset(offset));
 			}
 		}
@@ -657,8 +662,15 @@ class SerializedGraph {
 			gp.target = executableNodes[cnt].Peer;
 			gp.size = executableNodes[cnt].Size;
 			gp.tag = executableNodes[cnt].Tag;
-			gp.proc = executableNodes[cnt].Proc;
+			gp.stream = executableNodes[cnt].Stream;
 			gp.nic = executableNodes[cnt].Nic;
+            gp.gpu = executableNodes[cnt].Gpu;
+            gp.peer_gpu = executableNodes[cnt].PeerGpu;
+            if (reader_) {
+                const auto& node = executableNodes[cnt];
+                gp.message_id = {true, node.Communicator, node.Channel,
+                                 node.Sequence, node.MessageKind, node.Chunk};
+            }
 			gp.starttime = executableNodes[cnt].start_time;
 			if (executableNodes[cnt].Type == OPTYPE_SEND) gp.type = OP_SEND;
 			else if (executableNodes[cnt].Type == OPTYPE_RECV) gp.type = OP_RECV;
@@ -676,10 +688,8 @@ class SerializedGraph {
 			uint32_t offset = N.StartDependOnMe[cnt];
 			assert(offset < num_nodes);
 	
-			int SIZEOF_NODE_INFO = sizeof(char) + sizeof(uint64_t) + sizeof(uint32_t)*7 + sizeof(uint8_t)*2;
-			uint32_t* dep_cnt = (uint32_t*) (mapping_start + sizeof(uint32_t)*2 + sizeof(uint32_t)*num_root_nodes + SIZEOF_NODE_INFO*offset);
-			(*dep_cnt)--;
-			if ((*dep_cnt) == 0) {
+			const auto remaining_dependencies = decrement_dependency_count(offset);
+			if (remaining_dependencies == 0) {
 				DeserializedNode freed = get_node_by_offset(offset);
 				freed.start_time = 0;
 				executableNodes.push_back(freed);
@@ -699,12 +709,9 @@ class SerializedGraph {
         for (uint32_t cnt = 0; cnt < N.DependOnMe.size(); cnt++) {
             uint32_t offset = N.DependOnMe[cnt];
 
-            int SIZEOF_NODE_INFO = sizeof(char) + sizeof(uint64_t) + sizeof(uint32_t) * 7 + sizeof(uint8_t) * 2;
-            uint32_t *dep_cnt = (uint32_t *)(mapping_start + sizeof(uint32_t) * 2 + sizeof(uint32_t) * num_root_nodes +
-                                             SIZEOF_NODE_INFO * offset);
-            (*dep_cnt)--;
+            const auto remaining_dependencies = decrement_dependency_count(offset);
             //printf("Node %u has %u dependencies - WRONG!\n", offset, *dep_cnt);	
-            if ((*dep_cnt) == 0) {
+            if (remaining_dependencies == 0) {
                 executableNodes.push_back(get_node_by_offset(offset));
             }
         }
@@ -725,9 +732,7 @@ class SerializedGraph {
 		for (uint32_t cnt=0; cnt<N.DependOnMe.size(); cnt++) {
 			uint32_t offset = N.DependOnMe[cnt];
 			//printf("Node %u has %u dependencies\n", offset, N.DependOnMe.size());
-			int SIZEOF_NODE_INFO = sizeof(char) + sizeof(uint64_t) + sizeof(uint32_t)*7 + sizeof(uint8_t)*2;
-			uint32_t* dep_cnt = (uint32_t*) (mapping_start + sizeof(uint32_t)*2 + sizeof(uint32_t)*num_root_nodes + SIZEOF_NODE_INFO*offset);
-			(*dep_cnt)--;
+			const auto remaining_dependencies = decrement_dependency_count(offset);
 			// Checks if offset is in node_start_time
 			if (node_start_time.find(offset) == node_start_time.end())
 			{
@@ -739,7 +744,7 @@ class SerializedGraph {
 			}			
 			//printf("Node %u has %u dependencies\n", offset, *dep_cnt);	
 			//printf("Node %u has %u dependencies\n", offset, *dep_cnt);
-			if ((*dep_cnt) == 0) 
+			if (remaining_dependencies == 0)
 			{
 				DeserializedNode freed = get_node_by_offset(offset);
 				freed.start_time = node_start_time[offset];
@@ -757,6 +762,7 @@ class Parser {
 
 	private:
 
+	std::unique_ptr<traceschema::AtlahsAdapter> reader_;
 	char* mapping_start; // argh. this should be void* but c++ is anal on void*-arithmetic
 	size_t mapping_length;
 	uint32_t num_ranks_in_schedule;
@@ -779,10 +785,10 @@ class Parser {
 
 	Parser(std::string filename, bool save_mem) {
 		
-		schedules_fd = fopen(filename.c_str(), "r+");
+		schedules_fd = fopen(filename.c_str(), save_mem ? "r+" : "rb");
 	    
 		if (schedules_fd == NULL) {
-			fprintf(stderr, "Couldn't open input file %s!\n", filename);
+			fprintf(stderr, "Couldn't open input file %s!\n", filename.c_str());
 			exit(EXIT_FAILURE);
 		}
 
@@ -791,6 +797,31 @@ class Parser {
 		mapping_length = get_file_size(schedules_fd);
 		fread(&magic_cookie, sizeof(uint64_t), 1, schedules_fd);
 	
+
+        const auto prefix = std::as_bytes(std::span(&magic_cookie, 1));
+        if (traceschema::has_binary_header_magic(prefix)) {
+            if (save_mem) throw std::invalid_argument("ATLAHS packed traces require a private mapping");
+            mapping_start = static_cast<char*>(mmap(nullptr, mapping_length,
+                PROT_READ | PROT_WRITE, MAP_PRIVATE, fileno(schedules_fd), 0));
+            if (mapping_start == MAP_FAILED) {
+                fclose(schedules_fd);
+                throw std::runtime_error("Cannot mmap ATLAHS schedule");
+            }
+            try {
+                reader_ = std::make_unique<traceschema::AtlahsAdapter>(
+                    std::span(reinterpret_cast<std::byte*>(mapping_start), mapping_length));
+                num_ranks_in_schedule = reader_->get_rank_count();
+                schedules.reserve(num_ranks_in_schedule);
+                for (uint32_t rank = 0; rank < num_ranks_in_schedule; ++rank)
+                    schedules.emplace_back(*reader_, rank);
+            } catch (...) {
+                munmap(mapping_start, mapping_length);
+                fclose(schedules_fd);
+                throw;
+            }
+            return;
+        }
+
 		if (magic_cookie == MAGIC_COOKIE_INVALID) {
 			fprintf(stderr, "This is serialized goal schedule was invalidated by a prior simulation run!\n");
 			exit(EXIT_FAILURE);
@@ -830,12 +861,21 @@ class Parser {
 		}
 	}
 
-	uint8_t GetNumCPU() {
-		return max_cpu+1;
+	uint32_t GetNumStreams() {
+        if (reader_) {
+            const auto count = reader_->get_resource_count(std::string{"stream_id"});
+            if (count > std::numeric_limits<int>::max())
+                throw std::invalid_argument("ATLAHS stream count exceeds its int-sized API");
+            return static_cast<uint32_t>(count);
+        }
+        return uint32_t{max_cpu}+1;
 	}
 
-	uint8_t GetNumNIC() {
-		return max_nic+1;
+    bool UsesExplicitGpuMapping() const { return reader_ != nullptr; }
+
+	uint32_t GetNumGPU() {
+        if (reader_) return reader_->get_resource_count(std::string{"gpu_id"});
+        return uint32_t{max_nic}+1;
 	}
 
 

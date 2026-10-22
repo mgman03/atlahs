@@ -54,7 +54,10 @@ def main():
 
     parser.add_argument('--zero-red-copy', action='store_true', help='Whether to set all the reduction copy time to zero')
     parser.add_argument('--merge-non-overlap', action='store_true', help='Whether to merge non-overlapping events for all streams if possible')
-    parser.add_argument("--unique-nic", action='store_true', help="Whether to assign a separate NIC ID for each GPU in GOAL")
+    gpu_options = parser.add_mutually_exclusive_group()
+    gpu_options.add_argument("--unique-nic", action='store_true', help="Whether to assign a separate NIC ID for each GPU in GOAL")
+    gpu_options.add_argument("--explicit-fields", "--explicit-gpu", dest="explicit_fields", action="store_true",
+                             help="Emit explicit GPU, stream and message-identity fields instead of overloading CPU, NIC and tag")
     args = parser.parse_args()
 
     if args.no_intermediate_output:
@@ -147,7 +150,7 @@ def main():
     # Goal_File_Name = './results/InterNode_MicroEvents_Dependency.goal'
     Goal_File_Name = os.path.join(output_dir, 'InterNode_MicroEvents_Dependency.goal')
     get_inter_node_microevents_dependency(Events_Parallel_Group, Comm_Init_Events, Comm_Info, SendRecvEvents_To_TaskCounter,
-                                          Goal_File_Name, profile_interval, args.zero_red_copy, args.unique_nic)
+                                          Goal_File_Name, profile_interval, args.zero_red_copy, args.unique_nic, args.explicit_fields)
     print('Internode goal file has been exported to InterNode_MicroEvents_Dependency.goal')
 
 if __name__ == '__main__':

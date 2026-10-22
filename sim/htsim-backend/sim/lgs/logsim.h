@@ -1,3 +1,4 @@
+#include "MessageIdentity.hpp"
 /* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
 #ifndef LOGSIM_H
 #define LOGSIM_H
@@ -53,6 +54,8 @@ class graph_node_properties {
     uint32_t handle; // handle for network layer :-/
     uint8_t proc;    // processing element for this operation
     uint8_t nic;     // network interface for this operation
+    MessageIdentity message_id;
+    uint32_t gpu = 0; // Explicit GPU ID; separate from the network-interface field.
     char type;       // see below
     bool updated = false;
 };
@@ -98,75 +101,7 @@ static const uint32_t ANY_TAG = ~0;
 //}
 #endif
 
-typedef struct {
-    // TODO: src and tag can go in case of hashmap matching
-    btime_t starttime; // only for visualization
-    uint32_t size, src, tag, offset;
-} ruqelem_t;
-typedef std::list<ruqelem_t> ruq_t;
-
-typedef unsigned int uint;
-typedef unsigned long int ulint;
-typedef unsigned long long int ullint;
-
-#ifdef LIST_MATCH
-// TODO this is really slow - reconsider design of rq and uq!
-// matches and removes element from list if found, otherwise returns
-// false
-static inline int match(const graph_node_properties &elem, ruq_t *q, ruqelem_t *retelem = NULL) {
-
-    // MATCH attempts (i.e., number of elements searched to find a matching
-    // element)
-    int match_attempts = 0;
-
-    // std::cout << "UQ size " << q->size() << "\n";
-
-    if (0)
-        printf("++ size is %lu,  host [%i] searching matching queue for src "
-               "target %i "
-               "tag "
-               "%i\n",
-               q->size(), elem.host, elem.target, elem.tag);
-    for (ruq_t::iterator iter = q->begin(); iter != q->end(); ++iter) {
-        match_attempts++;
-        if (0)
-            printf("Compared element is -> %d %d vs %d %d\n", iter->src, iter->tag, elem.target, elem.tag);
-        if (elem.target == ANY_SOURCE || iter->src == ANY_SOURCE || iter->src == elem.target) {
-            if (elem.tag == ANY_TAG || iter->tag == ANY_TAG || iter->tag == elem.tag) {
-                if (retelem)
-                    *retelem = *iter;
-                q->erase(iter);
-                return match_attempts;
-            }
-        }
-    }
-    return -1;
-}
-#else
-class myhash { // I WANT LAMBDAS! :)
-  public:
-    size_t operator()(const std::pair<int, int> &x) const { return (x.first >> 16) + x.second; }
-};
-typedef std::hash_map<std::pair</*tag*/ int, int /*src*/>, std::queue<ruqelem_t>, myhash> ruq_t;
-static inline int match(const graph_node_properties &elem, ruq_t *q, ruqelem_t *retelem = NULL) {
-
-    if (print)
-        printf("++ [%i] searching matching queue for src %i tag %i\n", elem.host, elem.target, elem.tag);
-
-    ruq_t::iterator iter = q->find(std::make_pair(elem.tag, elem.target));
-    if (iter == q->end()) {
-        return -1;
-    }
-    std::queue<ruqelem_t> *tq = &iter->second;
-    if (tq->empty()) {
-        return -1;
-    }
-    if (retelem)
-        *retelem = tq->front();
-    tq->pop();
-    return 0;
-}
-#endif
+#include "MessageMatching.hpp"
 
 int size_queue(std::vector<ruq_t> my_queue, int num_proce);
 #endif /* LOGSIM_H */
