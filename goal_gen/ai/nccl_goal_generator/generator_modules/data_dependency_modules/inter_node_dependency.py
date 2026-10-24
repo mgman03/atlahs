@@ -6,7 +6,7 @@ from .intra_node_gpu_transfer_time import get_intra_node_gpu_transfer_time
 from .reduction_copy_time import get_reduction_time, get_copy_time
 
 def format_stream_fields(stream, explicit_fields):
-    # Preserve the generator's scheduling-resource numbering, independently of CPU.
+    # In explicit mode the stream number moves from `cpu` to `stream_id`.
     return f"cpu 0 stream_id {stream}" if explicit_fields else f"cpu {stream}"
 
 
@@ -16,8 +16,8 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                           zero_red_copy=False, unique_nic=False, explicit_fields=False):
     if explicit_fields and unique_nic:
         raise ValueError("Choose explicit GPU attributes or legacy unique NIC encoding, not both")
-    # Use exactly the same numeric ordering as the local gpu_id assignment.
-    # A peer GPU is resolved on its actual host, never inferred from our local ID.
+    # Host-local GPU indices, in the same order as the gpu_id assignment below.
+    # Peer GPUs are looked up on the peer's host.
     host_gpu_ids = {
         host: {int(gpu): local for local, gpu in enumerate(sorted(events, key=int))}
         for host, events in nccl_group_events.items()
@@ -31,6 +31,20 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"Cannot resolve peer GPU {gpu!r} on GOAL rank {host!r}") from error
         return f" peer_gpu_id {local}"
+
+    def calc(duration):
+        return (f"calc {duration} {format_stream_fields(cpu_counter, explicit_fields)}"
+                f"{gpu_attribute}{calculation_attributes}")
+
+    def comm_fields(peer_rank, peer_gpu, message_attributes, legacy_nic=" nic "):
+        # legacy_nic reproduces upstream's spacing so legacy output stays byte-identical:
+        # a few upstream lines write "cpu 3nic 0" (parsers accept it) or omit nic.
+        if explicit_fields:
+            nic = f" nic {nicId}"
+        else:
+            nic = f"{legacy_nic}{nicId}" if legacy_nic else ""
+        return (f"{format_stream_fields(cpu_counter, explicit_fields)}{nic}{gpu_attribute}"
+                f"{peer_gpu_fields(peer_rank, peer_gpu)}{message_attributes}")
 
     num_ranks = len(nccl_group_events)
     # Intra-node recv->send constraints are optional.
@@ -75,20 +89,20 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
             cpu_counter = 0
             gpuId_commId_cpu_counter = {}
 
-            # Rank-wide zero-duration fence nodes belong to no physical GPU.
-            # Use GPU 0 so every operation has the same declared attributes.
+            # The rank-wide start/end fences run on no particular GPU; they use GPU 0
+            # because every operation must carry the same attributes.
             gpu_attribute = " gpu_id 0" if explicit_fields else ""
             goal_events = nccl_group_events[goal_rank]
             task_counter += 1
-            file.write(f"l{task_counter}: calc 0 {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n") ## Start point of the node
+            file.write(f"l{task_counter}: {calc(0)}\n") ## Start point of the node
             node_start_calc_id = task_counter
             
             task_counter += 1
-            file.write(f"l{task_counter}: calc 0 {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n") ## End point of the node
+            file.write(f"l{task_counter}: {calc(0)}\n") ## End point of the node
             node_end_calc_id = task_counter
 
             for gpu_idx, gpuId in enumerate(sorted(goal_events.keys(), key=int)):
-                # Stable dense GPU ID local to this host, independent of global trace IDs.
+                # Dense host-local index, not the global trace ID.
                 gpu_attribute = f" gpu_id {gpu_idx}" if explicit_fields else ""
                 gpu_events = goal_events[gpuId]
                 if unique_nic:
@@ -142,13 +156,13 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                         gap = group_event['ts_group_gpu_start'] - last_group_event_end_time
                         if gap < 0:
                             gap = 0
-                        file.write(f"l{task_counter}: calc {gap} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")  ## Former calc between first group host event start and last group gpu event end
+                        file.write(f"l{task_counter}: {calc(gap)}\n")  ## Former calc between first group host event start and last group gpu event end
                         # calc_time += group_event['ts_group_gpu_start'] - last_group_event_end_time
                         file.write(f"l{task_counter} requires l{last_group_event_end_id}\n")
                         group_event_start_calc_id = task_counter
 
                         task_counter += 1
-                        file.write(f"l{task_counter}: calc 0 {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")  ## End calc of the parallel group of events
+                        file.write(f"l{task_counter}: {calc(0)}\n")  ## End calc of the parallel group of events
                         group_event_end_calc_id = task_counter
                         last_group_event_end_time = group_event['ts_group_gpu_end']
                         last_group_event_end_id = task_counter
@@ -175,12 +189,12 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
 
                                 if launched == 0:
                                     task_counter += 1
-                                    file.write(f"l{task_counter}: calc 0 {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")  ## Former calc between nccl kernel launch end and host event start
+                                    file.write(f"l{task_counter}: {calc(0)}\n")  ## Former calc between nccl kernel launch end and host event start
                                     file.write(f"l{task_counter} requires l{group_event_start_calc_id}\n")
                                     p2p_group_start_calc_id = task_counter
 
                                     task_counter += 1
-                                    file.write(f"l{task_counter}: calc 0 {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                    file.write(f"l{task_counter}: {calc(0)}\n")
                                     file.write(f"l{group_event_end_calc_id} requires l{task_counter}\n")
                                     p2p_group_end_calc_id = task_counter
 
@@ -218,18 +232,18 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                         if p2p_event_type == 'Send':
                                             if goal_rank_peer != goal_rank:
                                                 tag, message_attributes = format_message_fields(p2p_index[p2p_peer_Ix], channel_id, p2p_seq, get_event_type(p2p_event_type), event['comm_index'], explicit_fields)
-                                                file.write(f"l{task_counter}: send {max(1, nelem)}b to {goal_rank_peer} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_peer, gpuId_peer)}{message_attributes}\n")
+                                                file.write(f"l{task_counter}: send {max(1, nelem)}b to {goal_rank_peer} tag {tag} {comm_fields(goal_rank_peer, gpuId_peer, message_attributes)}\n")
                                                 p2p_index[p2p_peer_Ix] += 1
                                             else:
-                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(nelem, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(nelem, 'Send', zero_red_copy))}\n")
 
                                         elif p2p_event_type == 'Recv':
                                             if goal_rank_peer != goal_rank:
                                                 tag, message_attributes = format_message_fields(p2p_index[p2p_peer_Ix], channel_id, p2p_seq, get_event_type(p2p_event_type), event['comm_index'], explicit_fields)
-                                                file.write(f"l{task_counter}: recv {max(1, nelem)}b from {goal_rank_peer} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_peer, gpuId_peer)}{message_attributes}\n")
+                                                file.write(f"l{task_counter}: recv {max(1, nelem)}b from {goal_rank_peer} tag {tag} {comm_fields(goal_rank_peer, gpuId_peer, message_attributes)}\n")
                                                 p2p_index[p2p_peer_Ix] += 1
                                             else:
-                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(nelem, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(nelem, 'Recv', zero_red_copy))}\n")
 
                                         file.write(f"l{task_counter} requires l{p2p_group_start_calc_id}\n")
                                         file.write(f"l{p2p_group_end_calc_id} requires l{task_counter}\n")
@@ -250,12 +264,12 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                 
                                 if launched == 0:
                                     task_counter += 1
-                                    file.write(f"l{task_counter}: calc 0 {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")  ## Former calc between nccl kernel launch end and host event start
+                                    file.write(f"l{task_counter}: {calc(0)}\n")  ## Former calc between nccl kernel launch end and host event start
                                     file.write(f"l{task_counter} requires l{group_event_start_calc_id}\n")
                                     gpu_event_start_calc_id = task_counter
 
                                     task_counter += 1
-                                    file.write(f"l{task_counter}: calc 0 {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")  ## end calc of a gpu event
+                                    file.write(f"l{task_counter}: {calc(0)}\n")  ## end calc of a gpu event
                                     file.write(f"l{group_event_end_calc_id} requires l{task_counter}\n")          
                                     gpu_event_end_calc_id = task_counter     
 
@@ -326,13 +340,13 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     task_counter += 1
                                                     if goal_rank_next != goal_rank:
                                                         tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                         send_index[nextIx] += 1
 
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -350,13 +364,13 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                             task_counter += 1
                                                             if goal_rank_next != goal_rank:
                                                                 tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 send_index[nextIx] += 1
 
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 send_index[nextIx] += 1
@@ -380,28 +394,28 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                         task_counter += 1
                                                         if goal_rank_prev != goal_rank:
                                                             tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             recv_index[prevIx] += 1
 
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                         task_counter += 1
-                                                        file.write(f"l{task_counter}: calc {get_reduction_time(nelem * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_reduction_time(nelem * type_size, proto, zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         
                                                         task_counter += 1
                                                         if goal_rank_next != goal_rank:
                                                             tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             send_index[nextIx] += 1
 
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -419,28 +433,28 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                                 task_counter += 1
                                                                 if goal_rank_prev != goal_rank:
                                                                     tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     recv_index[prevIx] += 1
 
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                                 task_counter += 1
-                                                                file.write(f"l{task_counter}: calc {get_reduction_time(sliceSize * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_reduction_time(sliceSize * type_size, proto, zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 
                                                                 task_counter += 1
                                                                 if goal_rank_next != goal_rank:
                                                                     tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                     send_index[nextIx] += 1
 
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -462,28 +476,28 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     task_counter += 1
                                                     if goal_rank_prev != goal_rank:
                                                         tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         recv_index[prevIx] += 1
                                                     
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                     task_counter += 1
-                                                    file.write(f"l{task_counter}: calc {get_reduction_time(nelem * type_size, proto, zero_red_copy) + get_copy_time(nelem * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                    file.write(f"l{task_counter}: {calc(get_reduction_time(nelem * type_size, proto, zero_red_copy) + get_copy_time(nelem * type_size, proto, zero_red_copy))}\n")
                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                     
                                                     task_counter += 1
                                                     if goal_rank_next != goal_rank:
                                                         tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                         send_index[nextIx] += 1
 
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -501,28 +515,28 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                             task_counter += 1
                                                             if goal_rank_prev != goal_rank:
                                                                 tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 recv_index[prevIx] += 1
 
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                             task_counter += 1
-                                                            file.write(f"l{task_counter}: calc {get_reduction_time(sliceSize * type_size, proto, zero_red_copy) + get_copy_time(sliceSize * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_reduction_time(sliceSize * type_size, proto, zero_red_copy) + get_copy_time(sliceSize * type_size, proto, zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             
                                                             task_counter += 1
                                                             if goal_rank_next != goal_rank:
                                                                 tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 send_index[nextIx] += 1
 
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             
@@ -548,28 +562,28 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                         task_counter += 1
                                                         if goal_rank_prev != goal_rank:
                                                             tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             recv_index[prevIx] += 1
 
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                         task_counter += 1
-                                                        file.write(f"l{task_counter}: calc {get_copy_time(nelem * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_copy_time(nelem * type_size, proto, zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         
                                                         task_counter += 1
                                                         if goal_rank_next != goal_rank:
                                                             tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes, legacy_nic='')}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             send_index[nextIx] += 1
 
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -587,28 +601,28 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                                 task_counter += 1
                                                                 if goal_rank_prev != goal_rank:
                                                                     tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     recv_index[prevIx] += 1
 
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                                 task_counter += 1
-                                                                file.write(f"l{task_counter}: calc {get_copy_time(sliceSize * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_copy_time(sliceSize * type_size, proto, zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 
                                                                 task_counter += 1
                                                                 if goal_rank_next != goal_rank:
                                                                     tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                     send_index[nextIx] += 1
 
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 
@@ -630,13 +644,13 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     task_counter += 1
                                                     if goal_rank_prev != goal_rank:
                                                         tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                         recv_index[prevIx] += 1
 
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -654,13 +668,13 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                             task_counter += 1
                                                             if goal_rank_prev != goal_rank:
                                                                 tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 recv_index[prevIx] += 1
                                                             
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -729,7 +743,7 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     nelem = 0 if nelem < 0 else nelem
                                                     if proto == '0':
                                                         task_counter += 1
-                                                        file.write(f"l{task_counter}: calc {get_reduction_time(nelem * type_size, proto, zero_red_copy) + get_copy_time(nelem * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_reduction_time(nelem * type_size, proto, zero_red_copy) + get_copy_time(nelem * type_size, proto, zero_red_copy))}\n")
                                                         calc_task_id = task_counter
 
                                                         for child_Ix in [child_1_Ix, child_2_Ix, child_3_Ix]:
@@ -740,26 +754,26 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                                 task_counter += 1
                                                                 if goal_rank != goal_rank_child:
                                                                     tag, message_attributes = format_message_fields(recv_index[child_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_child} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_child, gpuId_child)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_child} tag {tag} {comm_fields(goal_rank_child, gpuId_child, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     file.write(f"l{calc_task_id} requires l{task_counter}\n")
                                                                     recv_index[child_Ix] += 1
 
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     file.write(f"l{calc_task_id} requires l{task_counter}\n")
 
                                                                 task_counter += 1
                                                                 if goal_rank != goal_rank_child:
                                                                     tag, message_attributes = format_message_fields(send_index[child_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_child} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_child, gpuId_child)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_child} tag {tag} {comm_fields(goal_rank_child, gpuId_child, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{calc_task_id}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                     send_index[child_Ix] += 1
 
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{calc_task_id}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -775,7 +789,7 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                                 sliceSize = sliceSize if sliceSize < nelem-offset else nelem-offset
 
                                                                 task_counter += 1
-                                                                file.write(f"l{task_counter}: calc {get_reduction_time(sliceSize * type_size, proto, zero_red_copy) + get_copy_time(sliceSize * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_reduction_time(sliceSize * type_size, proto, zero_red_copy) + get_copy_time(sliceSize * type_size, proto, zero_red_copy))}\n")
                                                                 calc_task_id = task_counter
 
                                                                 for child_Ix in [child_1_Ix, child_2_Ix, child_3_Ix]:
@@ -786,26 +800,26 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                                         task_counter += 1
                                                                         if goal_rank_child != goal_rank:
                                                                             tag, message_attributes = format_message_fields(recv_index[child_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                            file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_child} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_child, gpuId_child)}{message_attributes}\n")
+                                                                            file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_child} tag {tag} {comm_fields(goal_rank_child, gpuId_child, message_attributes)}\n")
                                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                             file.write(f"l{calc_task_id} requires l{task_counter}\n")
                                                                             recv_index[child_Ix] += 1
 
                                                                         else:
-                                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy))}\n")
                                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                             file.write(f"l{calc_task_id} requires l{task_counter}\n")
 
                                                                         task_counter += 1
                                                                         if goal_rank_child != goal_rank:
                                                                             tag, message_attributes = format_message_fields(send_index[child_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                            file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_child} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_child, gpuId_child)}{message_attributes}\n")
+                                                                            file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_child} tag {tag} {comm_fields(goal_rank_child, gpuId_child, message_attributes)}\n")
                                                                             file.write(f"l{task_counter} requires l{calc_task_id}\n")
                                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                             send_index[child_Ix] += 1
 
                                                                         else:
-                                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy))}\n")
                                                                             file.write(f"l{task_counter} requires l{calc_task_id}\n")
                                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 
@@ -823,24 +837,24 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                         task_counter += 1  ## Send
                                                         if goal_rank_parent != goal_rank:
                                                             tag, message_attributes = format_message_fields(send_index[parent_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_parent} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_parent, gpuId_parent)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_parent} tag {tag} {comm_fields(goal_rank_parent, gpuId_parent, message_attributes)}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             send_index[parent_Ix] += 1
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
                                                         task_counter += 1  ## Recv
                                                         if goal_rank_parent != goal_rank:
                                                             tag, message_attributes = format_message_fields(recv_index[parent_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_parent} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_parent, gpuId_parent)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_parent} tag {tag} {comm_fields(goal_rank_parent, gpuId_parent, message_attributes)}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             recv_index[parent_Ix] += 1
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -858,24 +872,24 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                                 task_counter += 1  ## Send
                                                                 if goal_rank_parent != goal_rank:
                                                                     tag, message_attributes = format_message_fields(send_index[parent_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_parent} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_parent, gpuId_parent)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_parent} tag {tag} {comm_fields(goal_rank_parent, gpuId_parent, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                     send_index[parent_Ix] += 1
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
                                                                 task_counter += 1  ## Recv
                                                                 if goal_rank_parent != goal_rank:
                                                                     tag, message_attributes = format_message_fields(recv_index[parent_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_parent} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_parent, gpuId_parent)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_parent} tag {tag} {comm_fields(goal_rank_parent, gpuId_parent, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                     recv_index[parent_Ix] += 1
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -892,7 +906,7 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     if proto == '0':
                                                         ## RecvReduceSend
                                                         task_counter += 1
-                                                        file.write(f"l{task_counter}: calc {get_reduction_time(nelem * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_reduction_time(nelem * type_size, proto, zero_red_copy))}\n")
                                                         calc_task_id = task_counter
 
                                                         for child_Ix in [child_1_Ix, child_2_Ix, child_3_Ix]:
@@ -903,42 +917,42 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                                 task_counter += 1
                                                                 if goal_rank_child != goal_rank:
                                                                     tag, message_attributes = format_message_fields(recv_index[child_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_child} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_child, gpuId_child)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_child} tag {tag} {comm_fields(goal_rank_child, gpuId_child, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     file.write(f"l{calc_task_id} requires l{task_counter}\n")
                                                                     recv_index[child_Ix] += 1
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     file.write(f"l{calc_task_id} requires l{task_counter}\n")
                                     
                                                         task_counter += 1
                                                         if goal_rank_parent != goal_rank:
                                                             tag, message_attributes = format_message_fields(send_index[parent_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_parent} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_parent, gpuId_parent)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_parent} tag {tag} {comm_fields(goal_rank_parent, gpuId_parent, message_attributes)}\n")
                                                             file.write(f"l{task_counter} requires l{calc_task_id}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             send_index[parent_Ix] += 1
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{calc_task_id}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
                                                         ## RecvCopySend
                                                         task_counter += 1
-                                                        file.write(f"l{task_counter}: calc {get_copy_time(nelem * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_copy_time(nelem * type_size, proto, zero_red_copy))}\n")
                                                         calc_task_id = task_counter
 
                                                         task_counter += 1
                                                         if goal_rank_parent != goal_rank:
                                                             tag, message_attributes = format_message_fields(recv_index[parent_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_parent} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_parent, gpuId_parent)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_parent} tag {tag} {comm_fields(goal_rank_parent, gpuId_parent, message_attributes)}\n")
                                                             file.write(f"l{calc_task_id} requires l{task_counter}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             recv_index[parent_Ix] += 1
 
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                             file.write(f"l{calc_task_id} requires l{task_counter}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         
@@ -950,12 +964,12 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                                 task_counter += 1
                                                                 if goal_rank_child != goal_rank:
                                                                     tag, message_attributes = format_message_fields(send_index[child_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_child} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_child, gpuId_child)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_child} tag {tag} {comm_fields(goal_rank_child, gpuId_child, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{calc_task_id}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                     send_index[child_Ix] += 1
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{calc_task_id}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -972,7 +986,7 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
 
                                                                 ## RecvReduceSend
                                                                 task_counter += 1
-                                                                file.write(f"l{task_counter}: calc {get_reduction_time(sliceSize * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_reduction_time(sliceSize * type_size, proto, zero_red_copy))}\n")
                                                                 calc_task_id = task_counter
 
                                                                 for child_Ix in [child_1_Ix, child_2_Ix, child_3_Ix]:
@@ -983,41 +997,41 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                                         task_counter += 1
                                                                         if goal_rank_child != goal_rank:
                                                                             tag, message_attributes = format_message_fields(recv_index[child_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                            file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_child} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_child, gpuId_child)}{message_attributes}\n")
+                                                                            file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_child} tag {tag} {comm_fields(goal_rank_child, gpuId_child, message_attributes)}\n")
                                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                             file.write(f"l{calc_task_id} requires l{task_counter}\n")
                                                                             recv_index[child_Ix] += 1
                                                                         else:
-                                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy))}\n")
                                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                             file.write(f"l{calc_task_id} requires l{task_counter}\n")
                                             
                                                                 task_counter += 1
                                                                 if goal_rank_parent != goal_rank:
                                                                     tag, message_attributes = format_message_fields(send_index[parent_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_parent} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_parent, gpuId_parent)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_parent} tag {tag} {comm_fields(goal_rank_parent, gpuId_parent, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{calc_task_id}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                     send_index[parent_Ix] += 1
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{calc_task_id}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
                                                                 ## RecvCopySend
                                                                 task_counter += 1
-                                                                file.write(f"l{task_counter}: calc {get_copy_time(sliceSize * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_copy_time(sliceSize * type_size, proto, zero_red_copy))}\n")
                                                                 calc_task_id = task_counter
 
                                                                 task_counter += 1
                                                                 if goal_rank_parent != goal_rank:
                                                                     tag, message_attributes = format_message_fields(recv_index[parent_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_parent} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_parent, gpuId_parent)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_parent} tag {tag} {comm_fields(goal_rank_parent, gpuId_parent, message_attributes)}\n")
                                                                     file.write(f"l{calc_task_id} requires l{task_counter}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     recv_index[parent_Ix] += 1
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy))}\n")
                                                                     file.write(f"l{calc_task_id} requires l{task_counter}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 
@@ -1029,12 +1043,12 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                                         task_counter += 1
                                                                         if goal_rank_child != goal_rank:
                                                                             tag, message_attributes = format_message_fields(send_index[child_Ix], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                            file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_child} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_child, gpuId_child)}{message_attributes}\n")
+                                                                            file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_child} tag {tag} {comm_fields(goal_rank_child, gpuId_child, message_attributes)}\n")
                                                                             file.write(f"l{task_counter} requires l{calc_task_id}\n")
                                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                             send_index[child_Ix] += 1
                                                                         else:
-                                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy))}\n")
                                                                             file.write(f"l{task_counter} requires l{calc_task_id}\n")
                                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 
@@ -1104,31 +1118,31 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                         task_counter += 1
                                                         if goal_rank_next != goal_rank:
                                                             tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: send {max(1, div_up(nelem, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)}nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: send {max(1, div_up(nelem, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes, legacy_nic='nic ')}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             send_index[nextIx] += 1
 
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Send', zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
                                                     else:  ## CopySend
                                                         task_counter += 1
-                                                        file.write(f"l{task_counter}: calc {get_copy_time(nelem, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_copy_time(nelem, proto, zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                         task_counter += 1
                                                         if goal_rank_next != goal_rank:
                                                             tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: send {max(1, div_up(nelem, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)}nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: send {max(1, div_up(nelem, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes, legacy_nic='nic ')}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             send_index[nextIx] += 1
 
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Send', zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1147,13 +1161,13 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                                 task_counter += 1
                                                                 if goal_rank_next != goal_rank:
                                                                     tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: send {max(1, sliceSize)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: send {max(1, sliceSize)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                     send_index[nextIx] += 1
 
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize, 'Send', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                     send_index[nextIx] += 1
@@ -1166,13 +1180,13 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                                 task_counter += 1
                                                                 if goal_rank_next != goal_rank:
                                                                     tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                    file.write(f"l{task_counter}: send {max(1, sliceSize)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                    file.write(f"l{task_counter}: send {max(1, sliceSize)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                     file.write(f"l{task_counter} requires l{task_counter -1}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                     send_index[nextIx] += 1
 
                                                                 else:
-                                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize, 'Send', zero_red_copy))}\n")
                                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                     send_index[nextIx] += 1
@@ -1188,13 +1202,13 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     task_counter += 1
                                                     if goal_rank_prev != goal_rank:
                                                         tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem, 8) * 16)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem, 8) * 16)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                         recv_index[prevIx] += 1
 
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1212,13 +1226,13 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                             task_counter += 1
                                                             if goal_rank_prev != goal_rank:
                                                                 tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 recv_index[prevIx] += 1
                                                             
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize, 'Recv', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1233,28 +1247,28 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     task_counter += 1
                                                     if goal_rank_prev != goal_rank:
                                                         tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem, 8) * 16)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem, 8) * 16)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         recv_index[prevIx] += 1
 
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                     task_counter += 1
-                                                    file.write(f"l{task_counter}: calc {get_copy_time(nelem, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                    file.write(f"l{task_counter}: {calc(get_copy_time(nelem, proto, zero_red_copy))}\n")
                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                     
                                                     task_counter += 1
                                                     if goal_rank_next != goal_rank:
                                                         tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                         send_index[nextIx] += 1
 
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Send', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1272,28 +1286,28 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                             task_counter += 1
                                                             if goal_rank_prev != goal_rank:
                                                                 tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 recv_index[prevIx] += 1
 
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize, 'Recv', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                             task_counter += 1
-                                                            file.write(f"l{task_counter}: calc {get_copy_time(sliceSize, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_copy_time(sliceSize, proto, zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             
                                                             task_counter += 1
                                                             if goal_rank_next != goal_rank:
                                                                 tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: send {max(1, sliceSize)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: send {max(1, sliceSize)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 send_index[nextIx] += 1
 
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize, 'Send', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             
@@ -1359,29 +1373,29 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     task_counter += 1
                                                     if goal_rank_next != goal_rank:
                                                         tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                         send_index[nextIx] += 1
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Send', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
                                                 else:  ## CopySend
                                                     task_counter += 1
-                                                    file.write(f"l{task_counter}: calc {get_copy_time(nelem, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                    file.write(f"l{task_counter}: {calc(get_copy_time(nelem, proto, zero_red_copy))}\n")
                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                     task_counter += 1
                                                     if goal_rank_next != goal_rank:
                                                         tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                         send_index[nextIx] += 1
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Send', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1400,29 +1414,29 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                             task_counter += 1
                                                             if goal_rank_next != goal_rank:
                                                                 tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: send {max(1, sliceSize)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: send {max(1, sliceSize)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 send_index[nextIx] += 1
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize, 'Send', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
                                                         else:  ## CopySend
                                                             task_counter += 1
-                                                            file.write(f"l{task_counter}: calc {get_copy_time(sliceSize, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_copy_time(sliceSize, proto, zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                             task_counter += 1
                                                             if goal_rank_next != goal_rank:
                                                                 tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: send {max(1, sliceSize)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: send {max(1, sliceSize)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 send_index[nextIx] += 1
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize, 'Send', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1441,26 +1455,26 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     task_counter += 1
                                                     if goal_rank_prev != goal_rank:
                                                         tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem, 8) * 16)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem, 8) * 16)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         recv_index[prevIx] += 1
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                     task_counter += 1
-                                                    file.write(f"l{task_counter}: calc {get_copy_time(nelem, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                    file.write(f"l{task_counter}: {calc(get_copy_time(nelem, proto, zero_red_copy))}\n")
                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                     
                                                     task_counter += 1
                                                     if goal_rank_next != goal_rank:
                                                         tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                         send_index[nextIx] += 1
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Send', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1478,26 +1492,26 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                             task_counter += 1
                                                             if goal_rank_prev != goal_rank:
                                                                 tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 recv_index[prevIx] += 1
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize, 'Recv', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                             task_counter += 1
-                                                            file.write(f"l{task_counter}: calc {get_copy_time(sliceSize, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_copy_time(sliceSize, proto, zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             
                                                             task_counter += 1
                                                             if goal_rank_next != goal_rank:
                                                                 tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: send {max(1, sliceSize)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: send {max(1, sliceSize)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 send_index[nextIx] += 1
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize, 'Send', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             
@@ -1512,12 +1526,12 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                 task_counter += 1
                                                 if goal_rank_prev != goal_rank:
                                                     tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                    file.write(f"l{task_counter}: recv {max(1, div_up(nelem, 8) * 16)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                    file.write(f"l{task_counter}: recv {max(1, div_up(nelem, 8) * 16)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                     recv_index[prevIx] += 1
                                                 else:
-                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1535,12 +1549,12 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                         task_counter += 1
                                                         if goal_rank_prev != goal_rank:
                                                             tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: recv {max(1, sliceSize)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: recv {max(1, sliceSize)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             recv_index[prevIx] += 1
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize, 'Recv', zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1602,12 +1616,12 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                 task_counter += 1
                                                 if goal_rank_next != goal_rank:
                                                     tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                    file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                    file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                     send_index[nextIx] += 1
                                                 else:
-                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy))}\n")
                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1625,12 +1639,12 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                         task_counter += 1
                                                         if goal_rank_next != goal_rank:
                                                             tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)}nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes, legacy_nic='nic ')}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             send_index[nextIx] += 1
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1649,26 +1663,26 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     task_counter += 1
                                                     if goal_rank_prev != goal_rank:
                                                         tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         recv_index[prevIx] += 1
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                     task_counter += 1
-                                                    file.write(f"l{task_counter}: calc {get_reduction_time(nelem * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                    file.write(f"l{task_counter}: {calc(get_reduction_time(nelem * type_size, proto, zero_red_copy))}\n")
                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                     
                                                     task_counter += 1
                                                     if goal_rank_next != goal_rank:
                                                         tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                         send_index[nextIx] += 1
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1686,26 +1700,26 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                             task_counter += 1
                                                             if goal_rank_prev != goal_rank:
                                                                 tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 recv_index[prevIx] += 1
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                             task_counter += 1
-                                                            file.write(f"l{task_counter}: calc {get_reduction_time(sliceSize * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_reduction_time(sliceSize * type_size, proto, zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             
                                                             task_counter += 1
                                                             if goal_rank_next != goal_rank:
                                                                 tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 send_index[nextIx] += 1
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             
@@ -1720,21 +1734,21 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                 task_counter += 1
                                                 if goal_rank_prev != goal_rank:
                                                     tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                    file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                    file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                     recv_index[prevIx] += 1
 
                                                     task_counter += 1
-                                                    file.write(f"l{task_counter}: calc {get_reduction_time(nelem * type_size, proto, zero_red_copy) + get_copy_time(nelem * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                    file.write(f"l{task_counter}: {calc(get_reduction_time(nelem * type_size, proto, zero_red_copy) + get_copy_time(nelem * type_size, proto, zero_red_copy))}\n")
                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
                                                 else:
-                                                    file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                    file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                     file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                     task_counter += 1
-                                                    file.write(f"l{task_counter}: calc {get_reduction_time(nelem * type_size, proto, zero_red_copy) + get_copy_time(nelem * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                    file.write(f"l{task_counter}: {calc(get_reduction_time(nelem * type_size, proto, zero_red_copy) + get_copy_time(nelem * type_size, proto, zero_red_copy))}\n")
                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1752,21 +1766,21 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                         task_counter += 1
                                                         if goal_rank_prev != goal_rank:
                                                             tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                            file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                            file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                             recv_index[prevIx] += 1
 
                                                             task_counter += 1
-                                                            file.write(f"l{task_counter}: calc {get_reduction_time(sliceSize * type_size, proto, zero_red_copy) + get_copy_time(sliceSize * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_reduction_time(sliceSize * type_size, proto, zero_red_copy) + get_copy_time(sliceSize * type_size, proto, zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
                                                         else:
-                                                            file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                             task_counter += 1
-                                                            file.write(f"l{task_counter}: calc {get_reduction_time(sliceSize * type_size, proto, zero_red_copy) + get_copy_time(sliceSize * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_reduction_time(sliceSize * type_size, proto, zero_red_copy) + get_copy_time(sliceSize * type_size, proto, zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1835,13 +1849,13 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     task_counter += 1
                                                     if goal_rank_next != goal_rank:
                                                         tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)}nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes, legacy_nic='nic ')}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                         send_index[nextIx] += 1
 
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1859,13 +1873,13 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                             task_counter += 1
                                                             if goal_rank_next != goal_rank:
                                                                 tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 send_index[nextIx] += 1
 
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 send_index[nextIx] += 1
@@ -1881,16 +1895,16 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     task_counter += 1
                                                     if goal_rank_prev != goal_rank:
                                                         tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         recv_index[prevIx] += 1
 
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                     task_counter += 1
-                                                    file.write(f"l{task_counter}: calc {get_reduction_time(nelem * type_size, proto, zero_red_copy) + get_copy_time(nelem * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                    file.write(f"l{task_counter}: {calc(get_reduction_time(nelem * type_size, proto, zero_red_copy) + get_copy_time(nelem * type_size, proto, zero_red_copy))}\n")
                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                     file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1908,16 +1922,16 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                             task_counter += 1
                                                             if goal_rank_prev != goal_rank:
                                                                 tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 recv_index[prevIx] += 1
 
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                             task_counter += 1
-                                                            file.write(f"l{task_counter}: calc {get_reduction_time(sliceSize * type_size, proto, zero_red_copy) + get_copy_time(sliceSize * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_reduction_time(sliceSize * type_size, proto, zero_red_copy) + get_copy_time(sliceSize * type_size, proto, zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             
@@ -1932,28 +1946,28 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                     task_counter += 1
                                                     if goal_rank_prev != goal_rank:
                                                         tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: recv {max(1, div_up(nelem * type_size, 8) * 16)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                         recv_index[prevIx] += 1
 
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Recv', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                     task_counter += 1
-                                                    file.write(f"l{task_counter}: calc {get_reduction_time(nelem * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                    file.write(f"l{task_counter}: {calc(get_reduction_time(nelem * type_size, proto, zero_red_copy))}\n")
                                                     file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                     
                                                     task_counter += 1
                                                     if goal_rank_next != goal_rank:
                                                         tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                        file.write(f"l{task_counter}: send {max(1, div_up(nelem * type_size, 8) * 16)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                         send_index[nextIx] += 1
 
                                                     else:
-                                                        file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                        file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(div_up(nelem * type_size, 8) * 16, 'Send', zero_red_copy))}\n")
                                                         file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                         file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
 
@@ -1971,28 +1985,28 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
                                                             task_counter += 1
                                                             if goal_rank_prev != goal_rank:
                                                                 tag, message_attributes = format_message_fields(recv_index[prevIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_prev, gpuId_prev)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: recv {max(1, sliceSize * type_size)}b from {goal_rank_prev} tag {tag} {comm_fields(goal_rank_prev, gpuId_prev, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
                                                                 recv_index[prevIx] += 1
 
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Recv', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                             task_counter += 1
-                                                            file.write(f"l{task_counter}: calc {get_reduction_time(sliceSize * type_size, proto, zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                            file.write(f"l{task_counter}: {calc(get_reduction_time(sliceSize * type_size, proto, zero_red_copy))}\n")
                                                             file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                             
                                                             task_counter += 1
                                                             if goal_rank_next != goal_rank:
                                                                 tag, message_attributes = format_message_fields(send_index[nextIx], channel_id, event['seq'], get_event_type(event['event_type']), event['comm_index'], explicit_fields)
-                                                                file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {format_stream_fields(cpu_counter, explicit_fields)} nic {nicId}{gpu_attribute}{peer_gpu_fields(goal_rank_next, gpuId_next)}{message_attributes}\n")
+                                                                file.write(f"l{task_counter}: send {max(1, sliceSize * type_size)}b to {goal_rank_next} tag {tag} {comm_fields(goal_rank_next, gpuId_next, message_attributes)}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                                 send_index[nextIx] += 1
 
                                                             else:
-                                                                file.write(f"l{task_counter}: calc {get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy)} {format_stream_fields(cpu_counter, explicit_fields)}{gpu_attribute}{calculation_attributes}\n")
+                                                                file.write(f"l{task_counter}: {calc(get_intra_node_gpu_transfer_time(sliceSize * type_size, 'Send', zero_red_copy))}\n")
                                                                 file.write(f"l{task_counter} requires l{task_counter - 1}\n")
                                                                 file.write(f"l{gpu_event_end_calc_id} requires l{task_counter}\n")
                                                             

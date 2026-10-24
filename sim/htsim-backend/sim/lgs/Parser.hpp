@@ -1,5 +1,6 @@
 #include <limits>
 #include <map>
+#include <memory>
 #include <vector>
 #include <string>
 #include <string.h>
@@ -15,7 +16,6 @@
 #include "LogGOPSim.hpp"
 #include "simulators/atlahs/AtlahsAdapter.hpp"
 #include "trace_format/BinaryFormat.hpp"
-#include <memory>
 
 #define MAGIC_COOKIE 4223
 #define MAGIC_COOKIE_INVALID 2342
@@ -863,7 +863,7 @@ class Parser {
 
 	uint32_t GetNumStreams() {
         if (reader_) {
-            const auto count = reader_->get_resource_count(std::string{"stream_id"});
+            const auto count = reader_->get_resource_count("stream_id");
             if (count > std::numeric_limits<int>::max())
                 throw std::invalid_argument("ATLAHS stream count exceeds its int-sized API");
             return static_cast<uint32_t>(count);
@@ -874,7 +874,7 @@ class Parser {
     bool UsesExplicitGpuMapping() const { return reader_ != nullptr; }
 
 	uint32_t GetNumGPU() {
-        if (reader_) return reader_->get_resource_count(std::string{"gpu_id"});
+        if (reader_) return reader_->get_resource_count("gpu_id");
         return uint32_t{max_nic}+1;
 	}
 

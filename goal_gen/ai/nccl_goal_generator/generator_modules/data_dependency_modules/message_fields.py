@@ -1,4 +1,4 @@
-"""Keep NCCL message identity separate from GOAL's numeric tag in explicit mode."""
+"""Format NCCL message identities as a GOAL tag (legacy) or as separate attributes (explicit)."""
 
 import operator
 
@@ -6,19 +6,13 @@ FIELD_NAMES = ("chunk_id", "channel_id", "sequence_id", "message_kind", "communi
 
 
 def unsigned_component(value):
-    if isinstance(value, str):
-        if not value.isascii() or not value.isdecimal():
-            raise ValueError("Message identity components must be unsigned integers")
-        number = int(value)
-    else:
-        try:
-            number = operator.index(value)
-        except TypeError as error:
-            raise ValueError("Message identity components must be unsigned integers") from error
-        if isinstance(value, bool):
-            raise ValueError("Message identity components must be unsigned integers")
-    if number < 0 or number > (1 << 64) - 1:
-        raise ValueError("Message identity components must fit unsigned 64-bit fields")
+    # Trace values arrive as ints or decimal strings; floats and bools are errors.
+    try:
+        number = int(value) if isinstance(value, str) and value.isdecimal() else operator.index(value)
+    except TypeError:
+        number = None
+    if number is None or isinstance(value, bool) or not 0 <= number < 1 << 64:
+        raise ValueError(f"Message identity component is not an unsigned 64-bit integer: {value!r}")
     return number
 
 
@@ -29,13 +23,13 @@ def format_message_fields(chunk, channel, sequence, kind, communicator, explicit
         if numbers[3] > 5:
             raise ValueError("Unknown NCCL message kind")
         attributes = "".join(f" {name} {number}" for name, number in zip(FIELD_NAMES, numbers))
-        # Matching uses the explicit tuple; the standard tag carries no metadata.
+        # The attributes identify the message, so the tag stays 0.
         return "0", attributes
-    # Preserve upstream output byte for byte for the legacy converter/scheduler.
+    # Upstream's decimal tag encoding, unchanged.
     return (str(chunk) + str(channel).zfill(2) + str(sequence).zfill(4)
             + str(kind).zfill(1) + str(communicator).zfill(2)), ""
 
 
 def calculation_message_fields(explicit):
-    # Calculation/fence nodes do not participate in message matching.
+    # Calculations are never matched, but must still carry every attribute.
     return format_message_fields(0, 0, 0, 0, 0, True)[1] if explicit else ""

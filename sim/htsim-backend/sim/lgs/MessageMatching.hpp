@@ -5,7 +5,7 @@
 #include <list>
 #include <vector>
 
-// Both the standalone scheduler and htsim use the same matching rules.
+// Shared by the standalone scheduler and the htsim backend.
 struct ruqelem_t {
     btime_t starttime = 0;
     std::uint32_t size = 0, src = 0, tag = 0, offset = 0, stream = 0, gpu = 0, peer_gpu = 0;

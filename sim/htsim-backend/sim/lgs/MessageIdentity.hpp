@@ -4,10 +4,9 @@
 #include <compare>
 #include <cstdint>
 
-// Runtime identity is compared component by component, never packed or hashed
-// into a bounded tag. Legacy records retain their original tag-based matching.
-// GPU endpoints are separate routing metadata. The queue matcher checks them
-// as well as this identity for explicit-field messages.
+// Identity of a message in an explicit-field trace, compared field by field.
+// Legacy traces match on the numeric tag instead. The GPU endpoints are not part
+// of the identity; the queue matcher checks them separately.
 struct MessageIdentity {
     bool explicit_fields = false;
     std::uint64_t communicator = 0;

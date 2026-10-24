@@ -1,5 +1,5 @@
-#include <cstdlib>
 #include "atlahs_htsim_api.h"
+#include <cstdlib>
 #include "eqds.h"
 #include "atlahs_event.h"
 #include "fat_tree_topology.h"
@@ -28,8 +28,9 @@ void AtlahsHtsimApi::Send(const SendEvent &event, graph_node_properties elem) {
         }
     }
     
-    // Optional routing audit: report the actual endpoints supplied to transport.
-    if (std::getenv("ATLAHS_TRACE_ROUTES"))
+    // Set ATLAHS_TRACE_ROUTES to print each send's transport endpoints (used by the tests).
+    static const bool trace_routes = std::getenv("ATLAHS_TRACE_ROUTES") != nullptr;
+    if (trace_routes)
         std::cout << "ATLAHS_ROUTE " << event.getFrom() << " " << event.getTo()
                   << " " << elem.gpu << " " << from << " " << to << std::endl;
 

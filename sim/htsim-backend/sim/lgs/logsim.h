@@ -12,7 +12,7 @@
 
 #define STRICT_ORDER // this is needed to keep order between Send/Recv and
                      // LocalOps in NBC case :-/
-#define LIST_MATCH   // enables debugging the queues (check if empty)
+#define LIST_MATCH   // required: MessageMatching.hpp only provides the list matcher
 #define HOSTSYNC     // this is experimental to count synchronization times induced
                      // by message transmissions
 
@@ -56,6 +56,7 @@ class graph_node_properties {
     uint8_t nic;     // network interface for this operation
     MessageIdentity message_id;
     uint32_t gpu = 0; // Explicit GPU ID; separate from the network-interface field.
+    uint32_t peer_gpu = 0; // Remote GPU for sends and receives.
     char type;       // see below
     bool updated = false;
 };

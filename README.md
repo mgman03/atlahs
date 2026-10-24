@@ -8,6 +8,19 @@ An Application-centric Network Simulator Toolchain for AI, HPC, and Distributed 
 <div align="left">
 
 
+## About this fork
+
+The `packed-trace-integration` branch lets the htsim backend read LogGOPSim's
+self-describing traces, and lets the NCCL generator write GPU and message-identity
+fields explicitly. The changed files are listed in the
+[comparison with upstream](https://github.com/spcl/atlahs/compare/main...mgman03:atlahs:packed-trace-integration).
+
+The htsim backend on this branch includes LogGOPSim's trace reader, so it is built
+from LogGOPSim rather than with the Makefiles alone: clone this repository next to
+LogGOPSim as `atlahs/` and configure LogGOPSim with `-DBUILD_ATLAHS=ON`. The steps are
+in `src/LogGOPSim/simulators/atlahs/README.md` in LogGOPSim. Everything else in
+ATLAHS is unchanged.
+
 ## Warning
 This repository is still under active development. The code is not yet stable, and the documentation is not yet finalized.
 

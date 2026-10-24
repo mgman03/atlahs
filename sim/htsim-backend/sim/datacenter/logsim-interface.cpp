@@ -261,6 +261,12 @@ void LogSimInterface::htsim_simulate_until(int64_t until) {
 int size_queue(std::vector<ruq_t> my_queue, int num_proce);
 
 
+// ATLAHS_TRACE_MATCHES prints every message match (used by the recorded-trace test).
+static bool trace_matches() {
+    static const bool enabled = std::getenv("ATLAHS_TRACE_MATCHES") != nullptr;
+    return enabled;
+}
+
 int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
     LogSimInterface *lgs_interface = &lgs;
 
@@ -303,7 +309,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
     const int ngpus = parser.GetNumGPU();
     lgs_interface->htsim_api->setGoalRankMappingFromBinaryHeader(
         static_cast<uint32_t>(p), ncpus, ngpus);
-    // Named GPU IDs remove the need to infer rank layout from CPU/NIC counts.
+    // With explicit gpu_id fields, the layout is known and not inferred from CPU/NIC counts.
     if (parser.UsesExplicitGpuMapping())
         lgs_interface->htsim_api->setGoalRankMapping(AtlahsHtsimApi::GoalRankMapping::UniqueNic);
     printf("[ATLAHS] GOAL rank mapping: %s (LGS ranks=%u, CPUs=%d, GPUs=%d, HTSIM nodes=%u)\n",
@@ -619,15 +625,15 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                 }
                 match_attempts = match(elem, &uq[elem.host], &matched_elem);
                 if(match_attempts >= 0) { // found it in local UQ 
-                    if (comm_dep_file_given || std::getenv("ATLAHS_TRACE_MATCHES")) {
+                    if (comm_dep_file_given) {
                         // Stores communication dependencies
                         auto dep = std::make_tuple(matched_elem.src, matched_elem.offset,
                                                 elem.host, elem.offset);
                         comm_deps.push_back(dep);
-                        if (std::getenv("ATLAHS_TRACE_MATCHES"))
-                            std::cout << "ATLAHS_MATCH " << std::get<0>(dep) << " " << std::get<1>(dep)
-                                      << " " << std::get<2>(dep) << " " << std::get<3>(dep) << "\n";
                     }
+                    if (trace_matches())
+                        std::cout << "ATLAHS_MATCH " << matched_elem.src << " " << matched_elem.offset
+                                  << " " << elem.host << " " << elem.offset << "\n";
                     if(debug_print)
                       printf("-- found in local UQ\n");
 
@@ -671,9 +677,9 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                     nelem.size = elem.size;
                     nelem.src = elem.target;
                     nelem.tag = elem.tag;
-                  nelem.message_id = elem.message_id;
-                  nelem.gpu = elem.gpu;
-                  nelem.peer_gpu = elem.peer_gpu;
+                    nelem.message_id = elem.message_id;
+                    nelem.gpu = elem.gpu;
+                    nelem.peer_gpu = elem.peer_gpu;
                     nelem.offset = elem.offset;
                     nelem.stream = elem.stream;
             #ifdef LIST_MATCH
@@ -729,15 +735,15 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
                       rq_max[elem.host] = std::max((int)rq[elem.host].size(), rq_max[elem.host]);
                     }
 
-                    if (comm_dep_file_given || std::getenv("ATLAHS_TRACE_MATCHES")) {
+                    if (comm_dep_file_given) {
                       // Stores communication dependencies
                       auto dep = std::make_tuple(elem.target, elem.offset,
                                                   elem.host, matched_elem.offset);
                       comm_deps.push_back(dep);
-                        if (std::getenv("ATLAHS_TRACE_MATCHES"))
-                            std::cout << "ATLAHS_MATCH " << std::get<0>(dep) << " " << std::get<1>(dep)
-                                      << " " << std::get<2>(dep) << " " << std::get<3>(dep) << "\n";
                     }
+                    if (trace_matches())
+                      std::cout << "ATLAHS_MATCH " << elem.target << " " << elem.offset
+                                << " " << elem.host << " " << matched_elem.offset << "\n";
 
                     if(qstat_given) {
                       // RECORD match queue statistics
@@ -970,10 +976,8 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
   
     }
     
-    if (!ok)
-      throw std::runtime_error("ATLAHS simulation ended with unmatched messages or receives");
     if (ok) {
-      if(p <= 128 && !batchmode_given) { // debug_print all hosts
+      if(p <= 128 && !batchmode_given) { // print all hosts
         printf("Times: \n");
         host = 0;
         for(uint i=0; i<p; ++i) {
@@ -990,7 +994,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
           //   }
           // }
         }
-      }  // debug_print only maximum
+      }  // print only maximum
       long long unsigned int max=0;
       int host=0;
       for(uint i=0; i<p; ++i) { // find maximum end time
@@ -1150,6 +1154,8 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
         }
         uq_miss_file.close();
       }
+    } else {
+      throw std::runtime_error("ATLAHS simulation ended with unmatched messages or receives");
     }
   printf("LGS terminates!\n");
   lgs_interface->terminate_sim();
