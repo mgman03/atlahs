@@ -15,11 +15,13 @@ self-describing traces, and lets the NCCL generator write GPU and message-identi
 fields explicitly. The changed files are listed in the
 [comparison with upstream](https://github.com/spcl/atlahs/compare/main...mgman03:atlahs:packed-trace-integration).
 
-The htsim backend on this branch includes LogGOPSim's trace reader, so it is built
-from LogGOPSim rather than with the Makefiles alone: clone this repository next to
-LogGOPSim as `atlahs/` and configure LogGOPSim with `-DBUILD_ATLAHS=ON`. The steps are
-in `src/LogGOPSim/simulators/atlahs/README.md` in LogGOPSim. Everything else in
-ATLAHS is unchanged.
+The htsim backend on this branch includes the trace reader from
+[LogGOPSim](https://github.com/AlexFalter/DPHPC26-LogGOPSim/tree/feature/self-describing-traces)
+(branch `feature/self-describing-traces`), so it is built from there rather than with
+the Makefiles alone: clone this repository next to LogGOPSim as `atlahs/` and configure
+LogGOPSim with `-DBUILD_ATLAHS=ON`. The steps are in
+[the adapter README](https://github.com/AlexFalter/DPHPC26-LogGOPSim/blob/feature/self-describing-traces/src/LogGOPSim/simulators/atlahs/README.md).
+Everything else in ATLAHS is unchanged.
 
 ## Warning
 This repository is still under active development. The code is not yet stable, and the documentation is not yet finalized.
