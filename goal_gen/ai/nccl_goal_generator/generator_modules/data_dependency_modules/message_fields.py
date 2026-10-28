@@ -29,7 +29,3 @@ def format_message_fields(chunk, channel, sequence, kind, communicator, explicit
     return (str(chunk) + str(channel).zfill(2) + str(sequence).zfill(4)
             + str(kind).zfill(1) + str(communicator).zfill(2)), ""
 
-
-def calculation_message_fields(explicit):
-    # Calculations are never matched, but must still carry every attribute.
-    return format_message_fields(0, 0, 0, 0, 0, True)[1] if explicit else ""

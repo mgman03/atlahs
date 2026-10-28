@@ -1,7 +1,7 @@
 import os
 
 from .utils import modRanks, div_up, get_event_type
-from .message_fields import format_message_fields, calculation_message_fields
+from .message_fields import format_message_fields
 from .intra_node_gpu_transfer_time import get_intra_node_gpu_transfer_time
 from .reduction_copy_time import get_reduction_time, get_copy_time
 
@@ -32,8 +32,13 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
             raise ValueError(f"Cannot resolve peer GPU {gpu!r} on GOAL rank {host!r}") from error
         return f" peer_gpu_id {local}"
 
-    def calc(duration):
-        return (f"calc {duration} {format_stream_fields(cpu_counter, explicit_fields)}"
+    # Calculations are never matched, but every operation must carry every declared field.
+    calculation_attributes = (format_message_fields(0, 0, 0, 0, 0, True)[1] + " peer_gpu_id 0"
+                              if explicit_fields else "")
+
+    def calc(duration, stream=None):
+        stream = cpu_counter if stream is None else stream
+        return (f"calc {duration} {format_stream_fields(stream, explicit_fields)}"
                 f"{gpu_attribute}{calculation_attributes}")
 
     def comm_fields(peer_rank, peer_gpu, message_attributes, legacy_nic=" nic "):
@@ -70,9 +75,6 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
     if unique_nic:
         print("[INFO] Assigning unique NIC for communication for each GPU")
 
-    calculation_attributes = calculation_message_fields(explicit_fields)
-    if explicit_fields:
-        calculation_attributes += " peer_gpu_id 0"
     max_comp_time = 0
     # task_counter = 0
     with open(goal_file_name, 'w') as file:
@@ -1174,7 +1176,9 @@ def get_inter_node_microevents_dependency(nccl_group_events, comm_init_events, c
 
                                                             else:  ## CopySend
                                                                 task_counter += 1
-                                                                file.write(f"l{task_counter}: calc {get_copy_time(sliceSize, proto, zero_red_copy)}{gpu_attribute}{calculation_attributes}\n")
+                                                                copy_time = get_copy_time(sliceSize, proto, zero_red_copy)
+                                                                # Upstream writes this calculation without a stream (so it runs on stream 0).
+                                                                file.write(f"l{task_counter}: {calc(copy_time, stream=0) if explicit_fields else f'calc {copy_time}'}\n")
                                                                 file.write(f"l{task_counter} requires l{gpu_event_start_calc_id}\n")
 
                                                                 task_counter += 1
