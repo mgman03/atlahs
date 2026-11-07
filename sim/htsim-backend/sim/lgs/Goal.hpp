@@ -2,7 +2,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#include "Parser.hpp"
+#include "LegacyGraph.hpp"
 
 typedef Node* goalop_t;
 

@@ -393,7 +393,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
       // retrieve all free operations
       //typedef std::vector<std::string> freeops_t;
       //freeops_t free_ops = sched->get_free_operations();
-      SerializedGraph::nodelist_t free_ops;
+      RankSchedule::nodelist_t free_ops;
       sched->GetExecutableNodes(&free_ops);
       // ensure that the free ops are ordered by type
       // std::sort(free_ops.begin(), free_ops.end(), gnp_op_comp_func());
@@ -401,7 +401,7 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
       num_events += sched->GetNumNodes();
   
       // walk all new free operations and throw them in the queue 
-      for(SerializedGraph::nodelist_t::iterator freeop=free_ops.begin(); freeop != free_ops.end(); ++freeop) {
+      for(RankSchedule::nodelist_t::iterator freeop=free_ops.begin(); freeop != free_ops.end(); ++freeop) {
         //if(debug_print) std::cout << *freeop << " " ;
   
         freeop->host = host;
@@ -845,17 +845,17 @@ int start_lgs(std::string filename_goal, LogSimInterface &lgs) {
       
       for (int host : check_hosts) {
 
-        SerializedGraph *sched=&parser.schedules[host];
+        RankSchedule *sched=&parser.schedules[host];
   
         // retrieve all free operations
-        SerializedGraph::nodelist_t free_ops;
+        RankSchedule::nodelist_t free_ops;
         //printf("Host1 %d - Free Ops Size %d\n", host, free_ops.size());
         sched->GetExecutableNodes(&free_ops);
         // ensure that the free ops are ordered by type
         // std::sort(free_ops.begin(), free_ops.end(), gnp_op_comp_func());
         
         // walk all new free operations and throw them in the queue 
-        for(SerializedGraph::nodelist_t::iterator freeop=free_ops.begin(); freeop != free_ops.end(); ++freeop) {
+        for(RankSchedule::nodelist_t::iterator freeop=free_ops.begin(); freeop != free_ops.end(); ++freeop) {
           //if(debug_print) std::cout << *freeop << " " ;
   
           new_events = true;
